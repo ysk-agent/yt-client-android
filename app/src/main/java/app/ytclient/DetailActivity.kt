@@ -46,6 +46,12 @@ class DetailActivity : AppCompatActivity() {
      * stored formatting prompt applies. Defaults to Japanese. */
     private var currentLang: String = "ja"
     private var videoTitle: String = ""
+    /** Channel name and video description, sent with every formatting
+     * request as read-only context: proper nouns that sound alone cannot
+     * resolve (a speaker's name in a self-introduction, …) often can be
+     * resolved from these. */
+    private var channelNameText: String = ""
+    private var videoDescription: String = ""
     private val geminiExec = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -55,6 +61,7 @@ class DetailActivity : AppCompatActivity() {
         val title = intent.getStringExtra("title") ?: ""
         videoTitle = title
         val channelName = intent.getStringExtra("channel_name")
+        channelNameText = channelName ?: ""
         val channelId = intent.getStringExtra("channel_id")
         val meta = listOfNotNull(
             intent.getStringExtra("duration"),
@@ -62,6 +69,7 @@ class DetailActivity : AppCompatActivity() {
             intent.getStringExtra("published"),
         ).joinToString(" · ")
         val description = intent.getStringExtra("description")
+        videoDescription = description ?: ""
 
         val scroll = ScrollView(this).apply { setBackgroundColor(Ui.BG) }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -436,6 +444,18 @@ class DetailActivity : AppCompatActivity() {
         val lang = currentLang
         val basePrompt = Prefs.formatPrompt(this, lang)
         val title = videoTitle
+        // Read-only context sent with every batch (bench-verified: the
+        // channel name resolves proper nouns that sound alone cannot,
+        // e.g. a speaker's name garbled in a self-introduction).
+        val meta = buildString {
+            append("\n\n動画タイトル：").append(title)
+            if (channelNameText.isNotBlank()) {
+                append("\nチャンネル名：").append(channelNameText)
+            }
+            if (videoDescription.isNotBlank()) {
+                append("\n動画の説明：").append(videoDescription.take(DESC_CHARS))
+            }
+        }
         val context = blocks.joinToString("") { it.body }.take(CONTEXT_CHARS)
         val token = loadToken
         formatting = true
@@ -454,7 +474,7 @@ class DetailActivity : AppCompatActivity() {
                 }.joinToString("\n")
                 val prompt = buildString {
                     append(basePrompt)
-                    append("\n\n動画タイトル：").append(title)
+                    append(meta)
                     if (bi == 0) {
                         append("\n参考として字幕全体の冒頭（整形対象ではありません）：\n")
                         append(context)
@@ -481,7 +501,7 @@ class DetailActivity : AppCompatActivity() {
                         try {
                             val single = geminiCallWithRetry(
                                 token,
-                                basePrompt + "\n\n動画タイトル：" + title,
+                                basePrompt + meta,
                                 blocks[i].body,
                             )
                             results[i] = STAMP_RE.replace(single, "").trim()
@@ -627,6 +647,8 @@ class DetailActivity : AppCompatActivity() {
         const val BATCH_CHARS = 1_000
         /** Characters of caption head sent as read-only context with batch 1. */
         const val CONTEXT_CHARS = 1_800
+        /** Video description is context, not content: its head is enough. */
+        const val DESC_CHARS = 500
         val MARK_RE = Regex("""\[\[BLOCK \d+\]\]""")
         val STAMP_RE = Regex("""\[\d+:\d{1,2}(:\d{2})?\]""")
         /** Appended to every batch prompt by code (never user-edited):
