@@ -1,15 +1,25 @@
 package app.ytclient
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Bundle
+import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONArray
 
 class DetailActivity : AppCompatActivity() {
+    /** Full text of the caption track currently shown, or null when no
+     * caption body is loaded. The copy-all button copies exactly this. */
+    private var currentSubtitle: String? = null
+    private var copyButton: TextView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val videoId = intent.getStringExtra("video_id") ?: ""
@@ -67,8 +77,27 @@ class DetailActivity : AppCompatActivity() {
             setPadding(dp(16), 0, dp(16), 0)
         }
         col.addView(trackBox)
+        val copyBtn = Ui.text(this, "字幕を一括コピー", 14f, Ui.TEXT, true).apply {
+            background = Ui.rounded(Ui.SURFACE, 10, this@DetailActivity)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            isEnabled = false
+            alpha = 0.45f
+            isClickable = true
+            setOnClickListener { copyAllSubtitles() }
+        }
+        copyButton = copyBtn
+        val copyWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(2), dp(16), 0)
+        }
+        copyWrap.addView(copyBtn)
+        (copyBtn.layoutParams as LinearLayout.LayoutParams).width = ViewGroup.LayoutParams.MATCH_PARENT
+        col.addView(copyWrap)
         val subtitleView = Ui.text(this, "", 13.5f, Ui.TEXT).apply {
             setPadding(dp(16), dp(12), dp(16), dp(32))
+            // Long-press selection with copy handles for the caption body.
+            setTextIsSelectable(true)
         }
         col.addView(subtitleView)
         setContentView(scroll)
@@ -109,6 +138,8 @@ class DetailActivity : AppCompatActivity() {
     }
 
     private fun loadSubtitle(videoId: String, lang: String, kind: String, out: TextView) {
+        currentSubtitle = null
+        setCopyEnabled(false)
         out.text = "字幕本文を取得中…"
         Bridge.call("fetch_subtitle", videoId, lang, kind) { data, err ->
             if (err != null || data == null) {
@@ -122,7 +153,31 @@ class DetailActivity : AppCompatActivity() {
                 val start = s.optLong("start_ms")
                 sb.append("[%d:%02d] %s\n".format(start / 60000, (start / 1000) % 60, s.optString("text")))
             }
-            out.text = if (sb.isEmpty()) "（セグメントなし）" else sb.toString()
+            if (sb.isEmpty()) {
+                out.text = "（セグメントなし）"
+            } else {
+                currentSubtitle = sb.toString()
+                setCopyEnabled(true)
+                out.text = sb.toString()
+            }
         }
+    }
+
+    private fun setCopyEnabled(enabled: Boolean) {
+        copyButton?.apply {
+            isEnabled = enabled
+            alpha = if (enabled) 1f else 0.45f
+        }
+    }
+
+    private fun copyAllSubtitles() {
+        val text = currentSubtitle
+        if (text.isNullOrBlank()) {
+            Toast.makeText(this, "コピーできる字幕がありません", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("字幕", text))
+        Toast.makeText(this, "字幕をコピーしました", Toast.LENGTH_SHORT).show()
     }
 }
