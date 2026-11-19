@@ -42,6 +42,10 @@ class DetailActivity : AppCompatActivity() {
     private var copyButton: TextView? = null
     private var formatButton: TextView? = null
     private var subtitleView: TextView? = null
+    /** Language code of the currently loaded caption track; selects which
+     * stored formatting prompt applies. Defaults to Japanese. */
+    private var currentLang: String = "ja"
+    private var videoTitle: String = ""
     private val geminiExec = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -49,6 +53,7 @@ class DetailActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         val videoId = intent.getStringExtra("video_id") ?: ""
         val title = intent.getStringExtra("title") ?: ""
+        videoTitle = title
         val channelName = intent.getStringExtra("channel_name")
         val channelId = intent.getStringExtra("channel_id")
         val meta = listOfNotNull(
@@ -202,6 +207,7 @@ class DetailActivity : AppCompatActivity() {
     private fun loadSubtitle(videoId: String, lang: String, kind: String, out: TextView) {
         loadToken++
         formatting = false
+        currentLang = lang
         currentSubtitle = null
         originalSubtitle = null
         formattedSubtitle = null
@@ -238,6 +244,15 @@ class DetailActivity : AppCompatActivity() {
                 originalSubtitle = sb.toString()
                 displayText(sb.toString())
                 setActionsEnabled(true)
+                // Prefetch design: formatting starts as soon as a caption
+                // body lands, batch 1 first, so the reader rarely waits
+                // for the head of the text. The button still toggles back
+                // to the original once formatting has produced a result.
+                if (BuildConfig.GEMINI_API_KEY.isNotBlank() &&
+                    BuildConfig.GEMINI_MODEL.isNotBlank()
+                ) {
+                    startFormatting()
+                }
             }
         }
     }
@@ -271,13 +286,16 @@ class DetailActivity : AppCompatActivity() {
     // -- Gemini formatting ---------------------------------------------------
 
     /**
-     * Prompt editor. The pipeline only ever sends the stored prompt plus
-     * the caption text, so editing here fully redefines what 整形 does
-     * (cleanup, translation, …) from the next run on.
+     * Prompt editor, scoped to the current track's language: prompts are
+     * stored per caption language, because what needs fixing differs by
+     * source language. The pipeline only ever sends the stored prompt
+     * plus the caption blocks, so editing here fully redefines what 整形
+     * does for that language (cleanup, translation, …) from the next run.
      */
     private fun showPromptDialog() {
+        val lang = currentLang
         val edit = EditText(this).apply {
-            setText(Prefs.formatPrompt(this@DetailActivity))
+            setText(Prefs.formatPrompt(this@DetailActivity, lang))
             inputType = InputType.TYPE_CLASS_TEXT or
                 InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -291,19 +309,19 @@ class DetailActivity : AppCompatActivity() {
             addView(edit)
         }
         AlertDialog.Builder(this)
-            .setTitle("整形プロンプト")
+            .setTitle("整形プロンプト（$lang）")
             .setView(container)
             .setPositiveButton("保存") { _, _ ->
                 val text = edit.text.toString()
                 if (text.isBlank()) {
                     Toast.makeText(this, "プロンプトが空のため保存しませんでした", Toast.LENGTH_SHORT).show()
                 } else {
-                    Prefs.setFormatPrompt(this, text)
+                    Prefs.setFormatPrompt(this, lang, text)
                     Toast.makeText(this, "プロンプトを保存しました", Toast.LENGTH_SHORT).show()
                 }
             }
             .setNeutralButton("デフォルトに戻す") { _, _ ->
-                Prefs.resetFormatPrompt(this)
+                Prefs.resetFormatPrompt(this, lang)
                 Toast.makeText(this, "デフォルトのプロンプトに戻しました", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("キャンセル", null)
@@ -328,55 +346,172 @@ class DetailActivity : AppCompatActivity() {
             Toast.makeText(this, "APIキーが設定されていません", Toast.LENGTH_SHORT).show()
             return
         }
-        startFormatting(orig)
+        startFormatting()
     }
 
-    private fun startFormatting(orig: String) {
-        // `orig` is the thinned display text: its [m:ss] stamps (first
-        // line, then ~1 per 30 s) go to the model as-is. What happens to
-        // them — keep, drop, move — is entirely the prompt's business;
-        // the pipeline itself is prompt-agnostic.
-        val chunks = chunkLines(orig, CHUNK_CHARS)
-        if (chunks.isEmpty()) return
-        // Read the prompt once per run, so an edit mid-run cannot change
-        // a job already in flight.
-        val prompt = Prefs.formatPrompt(this)
+    /** One caption block: the text between two thinned timestamps. The
+     * stamp itself is owned by this pipeline — it is never sent to the
+     * model, and is re-attached to the formatted body afterwards — so a
+     * prompt can no longer lose or move timestamps. */
+    private data class Block(val stamp: String, val body: String)
+
+    private class GeminiException(val status: Int, message: String) :
+        RuntimeException(message)
+
+    /** Splits the thinned display text into blocks at its stamp lines. */
+    private fun parseBlocks(text: String): List<Block> {
+        val stampRe = Regex("""^\[(\d+):(\d{2})\]\s?""")
+        // CJK caption fragments join without spaces; space-separated
+        // languages need the space back between segment lines.
+        val sep = if (currentLang.startsWith("ja") || currentLang.startsWith("zh") ||
+            currentLang.startsWith("ko")
+        ) "" else " "
+        val blocks = ArrayList<Block>()
+        var stamp: String? = null
+        val body = StringBuilder()
+        fun flush() {
+            val s = stamp ?: return
+            blocks.add(Block(s, body.toString()))
+            body.setLength(0)
+        }
+        for (line in text.split("\n")) {
+            val m = stampRe.find(line)
+            if (m != null) {
+                flush()
+                stamp = "[${m.groupValues[1]}:${m.groupValues[2]}]"
+                body.append(line.substring(m.range.last + 1))
+            } else if (stamp != null) {
+                if (body.isNotEmpty() && sep.isNotEmpty()) body.append(sep)
+                body.append(line)
+            }
+        }
+        flush()
+        return blocks
+    }
+
+    /** Batch 1 is just the first two blocks (with a wide context prefill,
+     * it returns fast and reads coherently); later batches group blocks
+     * up to roughly [BATCH_CHARS] of body text. */
+    private fun makeBatches(blocks: List<Block>): List<List<Int>> {
+        val batches = ArrayList<List<Int>>()
+        if (blocks.isEmpty()) return batches
+        batches.add((0 until minOf(2, blocks.size)).toList())
+        var cur = ArrayList<Int>()
+        var len = 0
+        for (i in 2 until blocks.size) {
+            if (cur.isNotEmpty() && len + blocks[i].body.length > BATCH_CHARS) {
+                batches.add(cur)
+                cur = ArrayList()
+                len = 0
+            }
+            cur.add(i)
+            len += blocks[i].body.length
+        }
+        if (cur.isNotEmpty()) batches.add(cur)
+        return batches
+    }
+
+    private fun assemble(blocks: List<Block>, results: Map<Int, String>): String =
+        blocks.mapIndexed { i, b -> "${b.stamp} ${results[i] ?: b.body}" }
+            .joinToString("\n\n")
+
+    /** Splits a marked multi-block response back into per-block texts.
+     * Returns null when the marker count does not match (the caller then
+     * falls back to per-block calls). Any [m:ss] strings the model
+     * hallucinated into its output are stripped: stamps live in code. */
+    private fun parseMarked(out: String, n: Int): List<String>? {
+        val parts = MARK_RE.split(out).map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size != n) return null
+        return parts.map { STAMP_RE.replace(it, "").trim() }
+    }
+
+    private fun startFormatting() {
+        val orig = originalSubtitle
+        if (orig.isNullOrBlank() || formatting) return
+        val blocks = parseBlocks(orig)
+        if (blocks.isEmpty()) return
+        val batches = makeBatches(blocks)
+        // Read the prompt for this track's language once per run, so an
+        // edit mid-run cannot change a job already in flight.
+        val lang = currentLang
+        val basePrompt = Prefs.formatPrompt(this, lang)
+        val title = videoTitle
+        val context = blocks.joinToString("") { it.body }.take(CONTEXT_CHARS)
         val token = loadToken
         formatting = true
         formatButton?.apply {
             isEnabled = false
             alpha = 0.7f
-            text = "整形中 0/${chunks.size}"
+            text = "整形中 0/${batches.size}"
         }
         geminiExec.execute {
-            val done = ArrayList<String>()
-            var error: String? = null
-            for (chunk in chunks) {
+            val results = HashMap<Int, String>()
+            var failedBatches = 0
+            for ((bi, idxs) in batches.withIndex()) {
                 if (token != loadToken) return@execute
-                try {
-                    done.add(geminiFormat(prompt, chunk))
-                } catch (e: Exception) {
-                    error = e.message ?: "不明なエラー"
-                    break
+                val payload = idxs.mapIndexed { j, i ->
+                    "[[BLOCK ${j + 1}]]\n${blocks[i].body}"
+                }.joinToString("\n")
+                val prompt = buildString {
+                    append(basePrompt)
+                    append("\n\n動画タイトル：").append(title)
+                    if (bi == 0) {
+                        append("\n参考として字幕全体の冒頭（整形対象ではありません）：\n")
+                        append(context)
+                    }
+                    append("\n").append(MARKER_RULE)
                 }
-                val partial = (done + chunks.subList(done.size, chunks.size))
-                    .joinToString("\n")
-                val n = done.size
+                var parsed: List<String>? = null
+                var callFailed = false
+                try {
+                    val out = geminiCallWithRetry(token, prompt, payload)
+                    parsed = parseMarked(out, idxs.size)
+                } catch (e: InterruptedException) {
+                    return@execute
+                } catch (e: Exception) {
+                    callFailed = true
+                }
+                if (parsed != null) {
+                    for ((i, p) in idxs.zip(parsed)) results[i] = p
+                } else if (!callFailed) {
+                    // The call succeeded but its markers did not parse:
+                    // redo this batch block by block (no markers).
+                    for (i in idxs) {
+                        if (token != loadToken) return@execute
+                        try {
+                            val single = geminiCallWithRetry(
+                                token,
+                                basePrompt + "\n\n動画タイトル：" + title,
+                                blocks[i].body,
+                            )
+                            results[i] = STAMP_RE.replace(single, "").trim()
+                        } catch (e: InterruptedException) {
+                            return@execute
+                        } catch (e: Exception) {
+                            // This block stays in its original wording.
+                        }
+                    }
+                } else {
+                    // A failed batch is NOT retried block by block: on a
+                    // rate limit that cascade only multiplies calls. Its
+                    // blocks stay in their original wording.
+                    failedBatches++
+                }
+                val snapshot = HashMap(results)
+                val n = bi + 1
                 mainHandler.post {
                     if (token != loadToken) return@post
-                    displayText(partial)
-                    formatButton?.text = "整形中 $n/${chunks.size}"
+                    displayText(assemble(blocks, snapshot))
+                    formatButton?.text = "整形中 $n/${batches.size}"
                 }
             }
-            val errMsg = error
             mainHandler.post {
                 if (token != loadToken) return@post
                 formatting = false
-                if (done.isNotEmpty()) {
+                if (results.isNotEmpty()) {
                     // Full or partial result stays on screen; the button
                     // becomes the way back to the original text.
-                    val result = (done + chunks.subList(done.size, chunks.size))
-                        .joinToString("\n")
+                    val result = assemble(blocks, results)
                     formattedSubtitle = result
                     showingFormatted = true
                     displayText(result)
@@ -392,10 +527,43 @@ class DetailActivity : AppCompatActivity() {
                         alpha = 1f
                     }
                 }
-                if (errMsg != null) {
+                if (failedBatches > 0) {
                     Toast.makeText(
-                        this@DetailActivity, "整形エラー: $errMsg", Toast.LENGTH_LONG
+                        this@DetailActivity,
+                        "一部の整形に失敗しました（該当箇所は原文のままです）",
+                        Toast.LENGTH_LONG,
                     ).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * One generateContent call with the retry policy the bench runs
+     * established: a 429 is a rate limit, not a failure — wait with
+     * backoff (20 s, then 40 s) and retry the same call; a 5xx gets one
+     * retry after a short wait; anything else throws at once.
+     */
+    private fun geminiCallWithRetry(token: Int, prompt: String, payload: String): String {
+        var attempt = 0
+        while (true) {
+            try {
+                return geminiFormat(prompt, payload)
+            } catch (e: GeminiException) {
+                attempt++
+                val waitMs = when {
+                    e.status == 429 && attempt <= 2 ->
+                        if (attempt == 1) 20_000L else 40_000L
+                    e.status >= 500 && attempt <= 1 -> 2_000L
+                    else -> throw e
+                }
+                // Sleep in slices so a track switch aborts promptly
+                // instead of blocking the single formatting thread.
+                var left = waitMs
+                while (left > 0) {
+                    if (token != loadToken) throw InterruptedException("stale")
+                    Thread.sleep(minOf(500L, left))
+                    left -= 500L
                 }
             }
         }
@@ -431,44 +599,40 @@ class DetailActivity : AppCompatActivity() {
                 val msg = try {
                     JSONObject(respText).optJSONObject("error")?.optString("message")
                 } catch (e: Exception) { null }
-                throw RuntimeException("HTTP $code" + if (!msg.isNullOrBlank()) ": $msg" else "")
+                throw GeminiException(
+                    code, "HTTP $code" + if (!msg.isNullOrBlank()) ": $msg" else ""
+                )
             }
             val candidates = JSONObject(respText).optJSONArray("candidates")
             if (candidates == null || candidates.length() == 0) {
-                throw RuntimeException("応答に候補がありません")
+                throw GeminiException(0, "応答に候補がありません")
             }
             val parts = candidates.getJSONObject(0).optJSONObject("content")
-                ?.optJSONArray("parts") ?: throw RuntimeException("応答の形式が不正です")
+                ?.optJSONArray("parts") ?: throw GeminiException(0, "応答の形式が不正です")
             val sb = StringBuilder()
             for (i in 0 until parts.length()) {
                 sb.append(parts.getJSONObject(i).optString("text"))
             }
             return sb.toString().trim().ifEmpty {
-                throw RuntimeException("整形結果が空でした")
+                throw GeminiException(0, "整形結果が空でした")
             }
         } finally {
             conn.disconnect()
         }
     }
 
-    /** Splits at line boundaries into chunks of roughly [limit] characters. */
-    private fun chunkLines(text: String, limit: Int): List<String> {
-        val out = ArrayList<String>()
-        val cur = StringBuilder()
-        for (line in text.split("\n")) {
-            if (cur.isNotEmpty() && cur.length + 1 + line.length > limit) {
-                out.add(cur.toString())
-                cur.setLength(0)
-            }
-            if (cur.isNotEmpty()) cur.append('\n')
-            cur.append(line)
-        }
-        if (cur.isNotEmpty()) out.add(cur.toString())
-        return out
-    }
-
     private companion object {
         const val TIMESTAMP_INTERVAL_MS = 30_000L
-        const val CHUNK_CHARS = 1_000
+        /** Body characters per batch after the first one. */
+        const val BATCH_CHARS = 1_000
+        /** Characters of caption head sent as read-only context with batch 1. */
+        const val CONTEXT_CHARS = 1_800
+        val MARK_RE = Regex("""\[\[BLOCK \d+\]\]""")
+        val STAMP_RE = Regex("""\[\d+:\d{1,2}(:\d{2})?\]""")
+        /** Appended to every batch prompt by code (never user-edited):
+         * the block-marker contract the parser relies on. */
+        const val MARKER_RULE =
+            "入力は [[BLOCK n]] の見出しで区切られた複数のブロックです。" +
+                "各ブロックを個別に整形し、見出しをそのまま付けて、同じ順序と個数で出力してください。"
     }
 }

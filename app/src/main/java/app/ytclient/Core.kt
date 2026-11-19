@@ -250,30 +250,59 @@ object Prefs {
     }
 
     /**
-     * The Gemini formatting prompt for the Detail screen. This is the one
-     * and only place the prompt lives: the formatting pipeline just sends
-     * `prompt + chunk` and never interprets it, so behaviour is changed by
-     * editing this text alone (a translation prompt, for instance, needs
-     * no pipeline changes). Stored in SharedPreferences once the user
-     * edits it; [DEFAULT_FORMAT_PROMPT] is the built-in default.
+     * Gemini formatting prompts for the Detail screen, kept per caption
+     * language: what needs fixing differs by source language (Japanese
+     * ASR cleanup vs. English-to-Japanese translation, …), so one prompt
+     * cannot serve both well. The pipeline only ever sends the stored
+     * prompt for the track's language plus the caption blocks, and never
+     * interprets it, so behaviour is changed by editing text alone.
+     * Timestamps are NOT part of the prompt's business any more: the
+     * pipeline owns them in code (blocks are split at stamp positions,
+     * stamps are re-attached afterwards), so no default prompt mentions
+     * them. Stored in SharedPreferences once the user edits a language's
+     * prompt; the DEFAULT_* texts are the built-in defaults.
      */
     val DEFAULT_FORMAT_PROMPT: String = listOf(
         "以下は動画の自動生成字幕テキストです。次の方針で整形してください。",
         "1. 句読点と改行を補って、読みやすくしてください。",
         "2. 音声認識の誤りは、文脈から明らかなものは正しい語に直してください。とくに、同音で漢字だけが違う取り違え、その話題の分野の専門用語への誤認、意味の通らない漢字列の音からの推測に注意してください。ただし数値そのものは変更しないでください。",
-        "3. [m:ss] の形のタイムスタンプは、削除したり移動したりせず、元の位置にそのまま残してください。",
-        "4. 要約、翻訳、内容の追加や削除、丁寧な文体への言い換えはしないでください。話し言葉の言い回しはそのまま残してください。",
-        "5. 出力は整形後の本文のみにしてください。",
+        "3. 要約、翻訳、内容の追加や削除、丁寧な文体への言い換えはしないでください。話し言葉の言い回しはそのまま残してください。",
+        "4. 出力は整形後の本文のみにしてください。",
     ).joinToString("\n")
 
-    fun formatPrompt(ctx: android.content.Context): String =
-        ctx.getSharedPreferences(FILE, 0).getString("format_prompt", null)
-            ?: DEFAULT_FORMAT_PROMPT
-    fun setFormatPrompt(ctx: android.content.Context, prompt: String) {
-        ctx.getSharedPreferences(FILE, 0).edit().putString("format_prompt", prompt).apply()
+    /** Built-in default for English tracks: translate + format to Japanese. */
+    val DEFAULT_FORMAT_PROMPT_EN: String = listOf(
+        "以下は動画の英語の自動生成字幕テキストです。次の方針で、日本語の字幕として整形してください。",
+        "1. 英語を自然な日本語に翻訳し、句読点と改行を補って読みやすくしてください。",
+        "2. 英語側の認識や翻訳の誤りは、文脈から明らかなものは正しい内容に直してください。固有名詞（人名、会社名、商品名、制度名）は、一般的な日本語表記に直してください。",
+        "3. 文頭の >> は話者交代の印です。出力には含めないでください。",
+        "4. 数値は原則として変更しないでください。ただし数値自体が明らかに壊れていて文脈と合わない場合に限り、文脈に合う数値に直してください。",
+        "5. 要約、内容の追加や削除はしないでください。",
+        "6. 出力は日本語の本文のみにしてください。",
+    ).joinToString("\n")
+
+    fun defaultFormatPrompt(lang: String): String =
+        if (lang.startsWith("en")) DEFAULT_FORMAT_PROMPT_EN else DEFAULT_FORMAT_PROMPT
+
+    fun formatPrompt(ctx: android.content.Context, lang: String): String {
+        val prefs = ctx.getSharedPreferences(FILE, 0)
+        prefs.getString("format_prompt_$lang", null)?.let { return it }
+        // v0.1.6 stored a single language-less prompt; it was edited
+        // against Japanese tracks, so it carries over to Japanese only.
+        if (lang.startsWith("ja")) {
+            prefs.getString("format_prompt", null)?.let { return it }
+        }
+        return defaultFormatPrompt(lang)
     }
-    fun resetFormatPrompt(ctx: android.content.Context) {
-        ctx.getSharedPreferences(FILE, 0).edit().remove("format_prompt").apply()
+    fun setFormatPrompt(ctx: android.content.Context, lang: String, prompt: String) {
+        ctx.getSharedPreferences(FILE, 0).edit()
+            .putString("format_prompt_$lang", prompt).apply()
+    }
+    fun resetFormatPrompt(ctx: android.content.Context, lang: String) {
+        val edit = ctx.getSharedPreferences(FILE, 0).edit()
+            .remove("format_prompt_$lang")
+        if (lang.startsWith("ja")) edit.remove("format_prompt")
+        edit.apply()
     }
 }
 
