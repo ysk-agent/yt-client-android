@@ -172,6 +172,10 @@ def feeds(channel_ids_json: str) -> str:
             items = []
             for cid, feed in feed_map.items():
                 for item in feed.items:
+                    # Shorts exclusion: the Atom feed marks Shorts via
+                    # their /shorts/<id> alternate link (FeedItem.is_shorts).
+                    if item.is_shorts:
+                        continue
                     d = _encode(item)
                     d["channel_id"] = cid
                     d["channel_name"] = feed.channel_name

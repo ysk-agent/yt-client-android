@@ -133,6 +133,7 @@ class FeedItem:
     updated_at: datetime | None = None
     view_count: int | None = None
     description: str | None = None
+    is_shorts: bool = False
 
     @property
     def thumbnail_url(self) -> str:
@@ -375,6 +376,10 @@ def parse_feed(channel_id: str, xml_text: str) -> ChannelFeed:
             except ValueError:
                 return None
 
+        # Shorts are marked in the feed itself: their alternate link is
+        # /shorts/<id> instead of /watch?v=<id>.
+        link_el = entry.find("atom:link", ATOM)
+        link_href = link_el.get("href") if link_el is not None else None
         feed.items.append(
             FeedItem(
                 video_id=video_id,
@@ -383,6 +388,7 @@ def parse_feed(channel_id: str, xml_text: str) -> ChannelFeed:
                 updated_at=_dt("updated"),
                 view_count=view_count,
                 description=description,
+                is_shorts=bool(link_href and "/shorts/" in link_href),
             )
         )
     return feed
