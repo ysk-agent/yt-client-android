@@ -6,13 +6,17 @@ import android.content.Context
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONArray
 import org.json.JSONObject
@@ -113,6 +117,15 @@ class DetailActivity : AppCompatActivity() {
         copyButton = copyBtn
         val fmtBtn = actionButton("整形") { onFormatClicked() }
         formatButton = fmtBtn
+        // Always available (unlike the two action buttons): the prompt can
+        // be reviewed or edited before any subtitle is loaded.
+        val promptBtn = Ui.text(this, "プロンプト", 12.5f, Ui.MUTED).apply {
+            background = Ui.rounded(Ui.SURFACE, 10, this@DetailActivity)
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            isClickable = true
+            setOnClickListener { showPromptDialog() }
+        }
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(2), dp(16), 0)
@@ -127,6 +140,11 @@ class DetailActivity : AppCompatActivity() {
         (fmtBtn.layoutParams as LinearLayout.LayoutParams).apply {
             width = 0
             weight = 1f
+            marginEnd = dp(8)
+        }
+        actionRow.addView(promptBtn)
+        (promptBtn.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.WRAP_CONTENT
         }
         col.addView(actionRow)
 
@@ -252,6 +270,46 @@ class DetailActivity : AppCompatActivity() {
 
     // -- Gemini formatting ---------------------------------------------------
 
+    /**
+     * Prompt editor. The pipeline only ever sends the stored prompt plus
+     * the caption text, so editing here fully redefines what 整形 does
+     * (cleanup, translation, …) from the next run on.
+     */
+    private fun showPromptDialog() {
+        val edit = EditText(this).apply {
+            setText(Prefs.formatPrompt(this@DetailActivity))
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 8
+            maxLines = 14
+            setSelection(text.length)
+        }
+        val container = FrameLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(edit)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("整形プロンプト")
+            .setView(container)
+            .setPositiveButton("保存") { _, _ ->
+                val text = edit.text.toString()
+                if (text.isBlank()) {
+                    Toast.makeText(this, "プロンプトが空のため保存しませんでした", Toast.LENGTH_SHORT).show()
+                } else {
+                    Prefs.setFormatPrompt(this, text)
+                    Toast.makeText(this, "プロンプトを保存しました", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("デフォルトに戻す") { _, _ ->
+                Prefs.resetFormatPrompt(this)
+                Toast.makeText(this, "デフォルトのプロンプトに戻しました", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("キャンセル", null)
+            .show()
+    }
+
     private fun onFormatClicked() {
         if (formatting) return
         if (showingFormatted) {
@@ -274,8 +332,15 @@ class DetailActivity : AppCompatActivity() {
     }
 
     private fun startFormatting(orig: String) {
-        val chunks = chunkLines(stripTimestamps(orig), CHUNK_CHARS)
+        // `orig` is the thinned display text: its [m:ss] stamps (first
+        // line, then ~1 per 30 s) go to the model as-is. What happens to
+        // them — keep, drop, move — is entirely the prompt's business;
+        // the pipeline itself is prompt-agnostic.
+        val chunks = chunkLines(orig, CHUNK_CHARS)
         if (chunks.isEmpty()) return
+        // Read the prompt once per run, so an edit mid-run cannot change
+        // a job already in flight.
+        val prompt = Prefs.formatPrompt(this)
         val token = loadToken
         formatting = true
         formatButton?.apply {
@@ -289,7 +354,7 @@ class DetailActivity : AppCompatActivity() {
             for (chunk in chunks) {
                 if (token != loadToken) return@execute
                 try {
-                    done.add(geminiFormat(chunk))
+                    done.add(geminiFormat(prompt, chunk))
                 } catch (e: Exception) {
                     error = e.message ?: "不明なエラー"
                     break
@@ -337,7 +402,7 @@ class DetailActivity : AppCompatActivity() {
     }
 
     /** One generateContent call for a single chunk. Throws on any failure. */
-    private fun geminiFormat(chunk: String): String {
+    private fun geminiFormat(prompt: String, chunk: String): String {
         val url = URL(
             "https://generativelanguage.googleapis.com/v1beta/models/" +
                 "${BuildConfig.GEMINI_MODEL}:generateContent"
@@ -345,7 +410,7 @@ class DetailActivity : AppCompatActivity() {
         val body = JSONObject().apply {
             put("contents", JSONArray().put(JSONObject().apply {
                 put("parts", JSONArray().put(
-                    JSONObject().put("text", FORMAT_PROMPT + "\n\n" + chunk)
+                    JSONObject().put("text", prompt + "\n\n" + chunk)
                 ))
             }))
             put("generationConfig", JSONObject().put("temperature", 0.2))
@@ -386,12 +451,6 @@ class DetailActivity : AppCompatActivity() {
         }
     }
 
-    private fun stripTimestamps(text: String): String =
-        text.lineSequence()
-            .map { it.replace(TIMESTAMP_PREFIX, "") }
-            .joinToString("\n")
-            .trim()
-
     /** Splits at line boundaries into chunks of roughly [limit] characters. */
     private fun chunkLines(text: String, limit: Int): List<String> {
         val out = ArrayList<String>()
@@ -411,10 +470,5 @@ class DetailActivity : AppCompatActivity() {
     private companion object {
         const val TIMESTAMP_INTERVAL_MS = 30_000L
         const val CHUNK_CHARS = 1_000
-        val TIMESTAMP_PREFIX = Regex("""^\[\d+:\d{2}\]\s*""")
-        const val FORMAT_PROMPT =
-            "以下は動画の字幕テキストです。句読点と改行を補って読みやすく整形してください。" +
-            "要約、翻訳、内容の追加や削除はしないでください。" +
-            "固有名詞と数値はそのまま残してください。出力は整形後の本文のみにしてください。"
     }
 }

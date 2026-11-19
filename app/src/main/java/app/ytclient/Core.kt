@@ -248,6 +248,33 @@ object Prefs {
     fun setFeedUpdatedAt(ctx: android.content.Context, group: String, at: Long) {
         ctx.getSharedPreferences(FILE, 0).edit().putLong("feed_updated_$group", at).apply()
     }
+
+    /**
+     * The Gemini formatting prompt for the Detail screen. This is the one
+     * and only place the prompt lives: the formatting pipeline just sends
+     * `prompt + chunk` and never interprets it, so behaviour is changed by
+     * editing this text alone (a translation prompt, for instance, needs
+     * no pipeline changes). Stored in SharedPreferences once the user
+     * edits it; [DEFAULT_FORMAT_PROMPT] is the built-in default.
+     */
+    val DEFAULT_FORMAT_PROMPT: String = listOf(
+        "以下は動画の自動生成字幕テキストです。次の方針で整形してください。",
+        "1. 句読点と改行を補って、読みやすくしてください。",
+        "2. 音声認識の誤りは、文脈から明らかなものは正しい語に直してください。とくに、同音で漢字だけが違う取り違え、その話題の分野の専門用語への誤認、意味の通らない漢字列の音からの推測に注意してください。ただし数値そのものは変更しないでください。",
+        "3. [m:ss] の形のタイムスタンプは、削除したり移動したりせず、元の位置にそのまま残してください。",
+        "4. 要約、翻訳、内容の追加や削除、丁寧な文体への言い換えはしないでください。話し言葉の言い回しはそのまま残してください。",
+        "5. 出力は整形後の本文のみにしてください。",
+    ).joinToString("\n")
+
+    fun formatPrompt(ctx: android.content.Context): String =
+        ctx.getSharedPreferences(FILE, 0).getString("format_prompt", null)
+            ?: DEFAULT_FORMAT_PROMPT
+    fun setFormatPrompt(ctx: android.content.Context, prompt: String) {
+        ctx.getSharedPreferences(FILE, 0).edit().putString("format_prompt", prompt).apply()
+    }
+    fun resetFormatPrompt(ctx: android.content.Context) {
+        ctx.getSharedPreferences(FILE, 0).edit().remove("format_prompt").apply()
+    }
 }
 
 /** "33分前" / "19時間前" / "2日前" style relative label for an epoch-ms time. */
