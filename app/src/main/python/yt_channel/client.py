@@ -100,6 +100,10 @@ class ChannelVideo:
     published_text: str | None = None
 
     @property
+    def is_shorts(self) -> bool:
+        return self.kind == "shorts"
+
+    @property
     def thumbnail_url(self) -> str:
         return thumbnail_url(self.video_id)
 

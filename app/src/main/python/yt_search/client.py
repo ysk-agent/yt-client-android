@@ -66,6 +66,10 @@ class SearchItem:
     view_count_text: str | None = None
     published_text: str | None = None
 
+    @property
+    def is_shorts(self) -> bool:
+        return self.kind == "shorts"
+
 
 @dataclass
 class SearchPage:
