@@ -29,17 +29,17 @@ PID=$(adb shell pidof $PKG | tr -d '\r\n'); echo "PID main: '$PID'"
 check_top MainActivity "MainActivity launch"
 screencap screenshot-main.png
 
-adb shell am start -n $PKG/.SearchActivity --es query "Federal Reserve"
+adb shell am start -n $PKG/.SearchActivity --es query "FRB"
 sleep 15
 check_top SearchActivity "SearchActivity launch"
 screencap screenshot-search.png
 
-adb shell am start -n $PKG/.DetailActivity --es video_id dQw4w9WgXcQ --es title "Rick Astley - Never Gonna Give You Up" --es channel_name "Rick Astley" --es channel_id UCuAXFkgswL7iGxMpRfFONQA
+adb shell am start -n $PKG/.DetailActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up" --es channel_name "Rick_Astley" --es channel_id UCuAXFkgswL7iGxMpRfFONQA
 sleep 15
 check_top DetailActivity "DetailActivity launch"
 screencap screenshot-detail.png
 
-adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG Japan"
+adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG_Japan"
 sleep 15
 check_top ChannelActivity "ChannelActivity launch"
 screencap screenshot-channel.png

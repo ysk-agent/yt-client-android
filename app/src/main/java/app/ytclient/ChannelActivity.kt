@@ -12,7 +12,11 @@ class ChannelActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val channelId = intent.getStringExtra("channel_id") ?: ""
-        val scroll = ScrollView(this).apply { setBackgroundColor(Ui.BG) }
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Ui.BG)
+            val sb = resources.getIdentifier("status_bar_height", "dimen", "android")
+            setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
+        }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(col)
 

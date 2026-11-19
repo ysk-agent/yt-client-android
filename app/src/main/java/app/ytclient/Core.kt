@@ -108,6 +108,7 @@ object Img {
 data class Video(
     val id: String,
     val title: String,
+    val kind: String = "video",
     val channelName: String? = null,
     val channelId: String? = null,
     val duration: String? = null,
@@ -131,6 +132,7 @@ data class Video(
             return Video(
                 id = o.optString("video_id"),
                 title = s("title") ?: "(無題)",
+                kind = s("kind") ?: "video",
                 channelName = s("channel_name"),
                 channelId = s("channel_id"),
                 duration = s("duration_text"),

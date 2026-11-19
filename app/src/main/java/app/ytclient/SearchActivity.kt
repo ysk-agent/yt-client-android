@@ -18,6 +18,8 @@ class SearchActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
+            val sb = resources.getIdentifier("status_bar_height", "dimen", "android")
+            setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
         }
         root.addView(Ui.heading(this, "「$query」の検索結果"))
         val status = Ui.text(this, "検索中…", 13f, Ui.MUTED).apply {
@@ -53,7 +55,7 @@ class SearchActivity : AppCompatActivity() {
                 return@call
             }
             val items = Video.list(data.optJSONArray("items"))
-                .filter { it.id.isNotBlank() }
+                .filter { it.id.isNotBlank() && (it.kind == "video" || it.kind == "shorts") }
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
             status.text = "${items.size} 件"
             adapter.set(items)
@@ -70,6 +72,7 @@ class SearchActivity : AppCompatActivity() {
                 return@call
             }
             val items = Video.list(data.optJSONArray("items"))
+                .filter { it.kind == "video" || it.kind == "shorts" }
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
             adapter.add(items)
             status.text = "全 ${adapter.itemCount} 件"
