@@ -39,7 +39,12 @@ class ChannelListActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val group = intent.getStringExtra("group_name") ?: "グループ"
-        ids.addAll(intent.getStringArrayListExtra("channel_ids") ?: arrayListOf())
+        // Accept both ArrayList (in-app) and String[] (adb --esa) extras.
+        ids.addAll(
+            intent.getStringArrayListExtra("channel_ids")
+                ?: intent.getStringArrayExtra("channel_ids")?.toList()
+                ?: emptyList()
+        )
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
@@ -47,7 +52,7 @@ class ChannelListActivity : AppCompatActivity() {
             setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
         }
         root.addView(Ui.heading(this, "「$group」のチャンネル"))
-        root.addView(Ui.text(this, "${ids.size} チャンネル（名前を取得中…）", 12.5f, Ui.MUTED).apply {
+        root.addView(Ui.text(this, "${ids.size} チャンネル", 12.5f, Ui.MUTED).apply {
             setPadding(dp(16), 0, dp(16), dp(6))
         })
         adapter = ListAdapter()
