@@ -167,6 +167,10 @@ data class Video(
     val views: String? = null,
     val published: String? = null,
     val description: String? = null,
+    /** Feed payloads carry this flag (Atom /shorts/ link). The bridge
+     * already drops Shorts from feeds; the UI filters again as defence
+     * in depth. Absent on search/browse payloads, where it stays false. */
+    val isShorts: Boolean = false,
 ) {
     val isLive: Boolean get() = duration?.equals("LIVE", ignoreCase = true) == true
 
@@ -195,6 +199,7 @@ data class Video(
                 views = views,
                 published = published,
                 description = s("description"),
+                isShorts = o.optBoolean("is_shorts", false),
             )
         }
 

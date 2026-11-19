@@ -229,7 +229,9 @@ class MainActivity : AppCompatActivity() {
                 status.text = "フィード取得エラー: $err"
                 return@call
             }
-            val items = Video.list(data.optJSONArray("items"))
+            // Defence in depth: the bridge already excludes Shorts from
+            // feeds, but drop any flagged item here too.
+            val items = Video.list(data.optJSONArray("items")).filter { !it.isShorts }
             val errs = data.optJSONObject("errors")
             Prefs.setFeedUpdatedAt(this, name, System.currentTimeMillis())
             updateUpdatedLabel()
