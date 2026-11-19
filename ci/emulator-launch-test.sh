@@ -13,7 +13,25 @@ check_top() {
   local top; top=$(top_activity); echo "top after $2: $top"
   if echo "$top" | grep -q "$PKG/.$1"; then echo "OK: $1 is top"; else note_fail "$1 not top after $2"; fi
 }
-screencap() { adb exec-out screencap -p > "$1" 2>/dev/null; echo "screenshot: $1 ($(stat -c%s "$1" 2>/dev/null) bytes)"; }
+dismiss_anr() {
+  # A system "isn't responding" dialog (the launcher ANR-ing under emulator
+  # load) would otherwise sit on top of every screenshot. Tap its "Wait".
+  adb shell uiautomator dump /sdcard/window_dump.xml >/dev/null 2>&1 || return 0
+  adb pull /sdcard/window_dump.xml window_dump.xml >/dev/null 2>&1 || return 0
+  grep -q "isn't responding" window_dump.xml || return 0
+  local node bounds nums
+  node=$(grep -o 'text="Wait"[^>]*' window_dump.xml | head -1)
+  bounds=$(echo "$node" | grep -o 'bounds="\[[0-9,]*\]\[[0-9,]*\]"' | head -1)
+  nums=$(echo "$bounds" | grep -o '[0-9]\+')
+  set -- $nums
+  if [ $# -eq 4 ]; then
+    local cx=$(( ($1 + $3) / 2 )) cy=$(( ($2 + $4) / 2 ))
+    echo "ANR dialog detected; tapping 'Wait' at $cx,$cy"
+    adb shell input tap "$cx" "$cy" || true
+    sleep 2
+  fi
+}
+screencap() { dismiss_anr; adb exec-out screencap -p > "$1" 2>/dev/null; echo "screenshot: $1 ($(stat -c%s "$1" 2>/dev/null) bytes)"; }
 
 adb root || true
 sleep 2

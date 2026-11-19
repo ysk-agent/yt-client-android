@@ -32,6 +32,8 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Ui.BG)
+            val sb = resources.getIdentifier("status_bar_height", "dimen", "android")
+            setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
         }
         // Search bar
         val searchRow = LinearLayout(this).apply {

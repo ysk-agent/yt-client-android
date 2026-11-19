@@ -57,6 +57,7 @@ jobs:
           name: launch-diagnostics
           path: |
             logcat.txt
+            window_dump.xml
             screenshot-main.png
             screenshot-search.png
             screenshot-detail.png
