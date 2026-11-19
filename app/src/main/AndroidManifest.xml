@@ -19,6 +19,7 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".ChannelListActivity" android:exported="false" />
         <activity android:name=".SearchActivity" android:exported="false" />
         <activity android:name=".DetailActivity" android:exported="false" />
         <activity android:name=".ChannelActivity" android:exported="false" />

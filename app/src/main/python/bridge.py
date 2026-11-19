@@ -66,6 +66,13 @@ def _run(coro_fn) -> str:
 
 # -- search -----------------------------------------------------------------
 
+def _videos_only(items):
+    """Shorts exclusion: yt_search tags Shorts as kind == "shorts"
+    (reelItemRenderer / shortsLockupViewModel). Only plain videos pass;
+    playlists, channels and lockups are dropped here too."""
+    return [i for i in items if i.kind == "video"]
+
+
 def search(query: str) -> str:
     async def go():
         from yt_search import YoutubeSearchClient
@@ -75,7 +82,7 @@ def search(query: str) -> str:
         ) as c:
             page = await c.search(query)
             return {
-                "items": page.items,
+                "items": _videos_only(page.items),
                 "continuation": page.continuation,
                 "estimated_results": page.estimated_results,
             }
@@ -91,7 +98,7 @@ def search_next(continuation: str) -> str:
             hl="ja", gl="JP", state_file=_state("yt_search")
         ) as c:
             page = await c.next_page(continuation)
-            return {"items": page.items, "continuation": page.continuation}
+            return {"items": _videos_only(page.items), "continuation": page.continuation}
 
     return _run(go)
 
@@ -106,24 +113,22 @@ def channel_videos(channel_id: str, sort: str = "latest") -> str:
             hl="ja", gl="JP", state_file=_state("yt_channel")
         ) as c:
             page = await c.videos(channel_id, sort=sort)
+            items = []
+            for item in page.items:
+                if item.kind == "shorts":
+                    continue
+                d = _encode(item)
+                # Browse items carry no channel identity of their own;
+                # stamp it so rows can show the channel name.
+                d["channel_id"] = channel_id
+                if page.channel is not None and page.channel.name:
+                    d["channel_name"] = page.channel.name
+                items.append(d)
             return {
-                "items": page.items,
+                "items": items,
                 "continuation": page.continuation,
                 "channel": page.channel,
             }
-
-    return _run(go)
-
-
-def channel_shorts(channel_id: str) -> str:
-    async def go():
-        from yt_channel import YoutubeChannelClient
-
-        async with YoutubeChannelClient(
-            hl="ja", gl="JP", state_file=_state("yt_channel")
-        ) as c:
-            page = await c.shorts(channel_id)
-            return {"items": page.items, "continuation": page.continuation}
 
     return _run(go)
 

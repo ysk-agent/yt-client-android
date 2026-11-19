@@ -35,11 +35,18 @@ class ChannelActivity : AppCompatActivity() {
         col.addView(descView)
 
         col.addView(Ui.heading(this, "動画"))
-        val videosAdapter = VideoAdapter(this, wide = false)
-        col.addView(horizontalRv(videosAdapter))
-        col.addView(Ui.heading(this, "Shorts"))
-        val shortsAdapter = VideoAdapter(this, wide = false)
-        col.addView(horizontalRv(shortsAdapter))
+        val videosAdapter = VideoAdapter(this)
+        val videosRv = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@ChannelActivity)
+            adapter = videosAdapter
+            setPadding(dp(12), 0, dp(12), 0)
+            clipToPadding = false
+            isNestedScrollingEnabled = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        col.addView(videosRv)
         val status = Ui.text(this, "", 12.5f, Ui.MUTED).apply {
             setPadding(dp(16), dp(10), dp(16), dp(28))
         }
@@ -64,22 +71,11 @@ class ChannelActivity : AppCompatActivity() {
                 status.text = "動画エラー: $err"
                 return@call
             }
-            videosAdapter.set(Video.list(data.optJSONArray("items")))
+            // No Shorts section: shorts items are dropped here too, in
+            // case a browse page mixes them into the videos tab.
+            videosAdapter.set(
+                Video.list(data.optJSONArray("items")).filter { it.kind == "video" }
+            )
         }
-        Bridge.call("channel_shorts", channelId) { data, err ->
-            if (err == null && data != null) {
-                shortsAdapter.set(Video.list(data.optJSONArray("items")))
-            }
-        }
-    }
-
-    private fun horizontalRv(adapter: VideoAdapter): RecyclerView = RecyclerView(this).apply {
-        layoutManager = LinearLayoutManager(this@ChannelActivity, LinearLayoutManager.HORIZONTAL, false)
-        this.adapter = adapter
-        setPadding(dp(16), 0, 0, dp(8))
-        clipToPadding = false
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        )
     }
 }

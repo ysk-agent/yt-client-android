@@ -62,6 +62,11 @@ sleep 15
 check_top ChannelActivity "ChannelActivity launch"
 screencap screenshot-channel.png
 
+adb shell am start -n $PKG/.ChannelListActivity --es group_name "経済" --esa channel_ids UCvbobBwsNzBY4IV1vLH6Kkg,UCuAXFkgswL7iGxMpRfFONQA
+sleep 15
+check_top ChannelListActivity "ChannelListActivity launch"
+screencap screenshot-channellist.png
+
 PID2=$(adb shell pidof $PKG | tr -d '\r\n'); echo "PID end: '$PID2'"
 [ -n "$PID2" ] || note_fail "process dead at end"
 adb logcat -d -v threadtime > logcat.txt 2>&1 || true

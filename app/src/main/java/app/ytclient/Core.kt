@@ -104,7 +104,59 @@ object Img {
     }
 }
 
-/** One video, normalised across feed / browse / search payloads. */
+/** User preferences shared across screens. */
+object Prefs {
+    private const val FILE = "ytclient_prefs"
+    fun thumbPct(ctx: android.content.Context): Int =
+        ctx.getSharedPreferences(FILE, 0).getInt("thumb_pct", 33)
+    fun setThumbPct(ctx: android.content.Context, pct: Int) {
+        ctx.getSharedPreferences(FILE, 0).edit().putInt("thumb_pct", pct).apply()
+    }
+    fun feedUpdatedAt(ctx: android.content.Context, group: String): Long =
+        ctx.getSharedPreferences(FILE, 0).getLong("feed_updated_$group", 0L)
+    fun setFeedUpdatedAt(ctx: android.content.Context, group: String, at: Long) {
+        ctx.getSharedPreferences(FILE, 0).edit().putLong("feed_updated_$group", at).apply()
+    }
+}
+
+/** "33分前" / "19時間前" / "2日前" style relative label for an epoch-ms time. */
+fun relTimeLabel(atMillis: Long, now: Long = System.currentTimeMillis()): String {
+    if (atMillis <= 0L) return "—"
+    val sec = (now - atMillis) / 1000
+    return when {
+        sec < 60 -> "たった今"
+        sec < 3600 -> "${sec / 60}分前"
+        sec < 86400 -> "${sec / 3600}時間前"
+        else -> "${sec / 86400}日前"
+    }
+}
+
+/** View count in the row format: 1097回 under 10k, else 6.0万回. */
+fun formatViews(n: Long): String =
+    if (n < 10000) "${n}回"
+    else String.format(java.util.Locale.US, "%.1f万回", n / 10000.0)
+
+/** Best-effort numeric view count from a localised view_count_text such as
+ * "329,239回視聴", "6.0万回視聴" or "1.2M views". */
+fun parseViews(text: String?): Long? {
+    if (text.isNullOrBlank()) return null
+    val t = text.replace(",", "").replace("，", "")
+    val num = Regex("""([\d.]+)""").find(t)?.groupValues?.get(1)?.toDoubleOrNull() ?: return null
+    val mult = when {
+        t.contains("億") -> 100_000_000.0
+        t.contains("万") -> 10_000.0
+        t.contains("B", ignoreCase = true) && t.contains("view", ignoreCase = true) -> 1_000_000_000.0
+        t.contains("M", ignoreCase = true) && t.contains("view", ignoreCase = true) -> 1_000_000.0
+        t.contains("K", ignoreCase = true) && t.contains("view", ignoreCase = true) -> 1_000.0
+        else -> 1.0
+    }
+    return (num * mult).toLong()
+}
+
+/** One video, normalised across feed / browse / search payloads.
+ * [views] and [published] are display-ready labels: views is "1097回" /
+ * "6.0万回" (never the word 再生回数), published is a relative age when the
+ * payload carries a timestamp, else the client's own age text. */
 data class Video(
     val id: String,
     val title: String,
@@ -116,19 +168,23 @@ data class Video(
     val published: String? = null,
     val description: String? = null,
 ) {
-    fun meta(): String = listOfNotNull(
-        channelName,
-        duration?.let { "$it" },
-        views,
-        published,
-    ).joinToString(" · ")
+    val isLive: Boolean get() = duration?.equals("LIVE", ignoreCase = true) == true
 
     companion object {
         fun from(o: JSONObject): Video {
             fun s(k: String): String? = if (o.isNull(k)) null else o.optString(k).ifBlank { null }
             val viewsRaw = if (o.isNull("view_count")) null else o.opt("view_count")
-            val views = s("view_count_text") ?: (viewsRaw as? Number)?.let { "%,d 回視聴".format(it.toLong()) }
-            val published = s("published_text") ?: s("published_at")?.let { it.substring(0, 10) }
+            val views = when {
+                viewsRaw is Number -> formatViews(viewsRaw.toLong())
+                else -> parseViews(s("view_count_text"))?.let { formatViews(it) }
+                    ?: s("view_count_text")?.replace("再生回数", "")?.removeSuffix("視聴")?.trim()?.ifBlank { null }
+            }
+            val published = s("published_text") ?: s("published_at")?.let { iso ->
+                try {
+                    val ms = java.time.OffsetDateTime.parse(iso).toInstant().toEpochMilli()
+                    relTimeLabel(ms)
+                } catch (e: Exception) { iso.substring(0, 10) }
+            }
             return Video(
                 id = o.optString("video_id"),
                 title = s("title") ?: "(無題)",

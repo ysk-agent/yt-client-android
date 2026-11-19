@@ -62,6 +62,7 @@ jobs:
             screenshot-search.png
             screenshot-detail.png
             screenshot-channel.png
+            screenshot-channellist.png
           if-no-files-found: warn
       - name: Upload APK
         uses: actions/upload-artifact@v4

@@ -2,18 +2,14 @@ package app.ytclient
 
 import android.content.Intent
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -21,11 +17,14 @@ import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 
 class MainActivity : AppCompatActivity() {
-    private lateinit var heroBox: FrameLayout
     private lateinit var status: TextView
+    private lateinit var updatedText: TextView
     private lateinit var feedAdapter: VideoAdapter
+    private lateinit var chipRow: LinearLayout
+    private lateinit var debugRow: LinearLayout
     private var groups: List<Pair<String, List<String>>> = emptyList()
     private var currentGroup = ""
+    private var currentIds: List<String> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,7 +34,8 @@ class MainActivity : AppCompatActivity() {
             val sb = resources.getIdentifier("status_bar_height", "dimen", "android")
             setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
         }
-        // Search bar
+
+        // Search bar: fully rounded pill; submitting opens SearchActivity.
         val searchRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(14), dp(16), dp(6))
@@ -46,14 +46,14 @@ class MainActivity : AppCompatActivity() {
             setHintTextColor(Ui.MUTED)
             setTextColor(Ui.TEXT)
             textSize = 15f
-            background = Ui.rounded(Ui.SURFACE, 24, this@MainActivity)
+            background = Ui.rounded(Ui.SURFACE, 28, this@MainActivity)
             setPadding(dp(18), dp(10), dp(18), dp(10))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             setSingleLine(true)
         }
         val go = Ui.text(this, "検索", 14f, Color.BLACK, true).apply {
-            background = Ui.rounded(Color.WHITE, 24, this@MainActivity)
+            background = Ui.rounded(Color.WHITE, 28, this@MainActivity)
             setPadding(dp(18), dp(10), dp(18), dp(10))
             setOnClickListener { submitSearch(input.text.toString()) }
         }
@@ -64,52 +64,90 @@ class MainActivity : AppCompatActivity() {
         ).apply { marginStart = dp(8) })
         root.addView(searchRow)
 
-        val scroll = ScrollView(this)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scroll.addView(col)
-        root.addView(scroll)
-
-        heroBox = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(300))
+        // Group chips.
+        val chipScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, dp(6), 0, dp(2))
         }
-        col.addView(heroBox)
-        status = Ui.text(this, "読み込み中…", 13f, Ui.MUTED).apply {
+        chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        chipScroll.addView(chipRow)
+        root.addView(chipScroll)
+
+        // Last-updated row with channel-list route and refresh.
+        val updRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(8), dp(16), 0)
         }
-        col.addView(status)
+        updatedText = Ui.text(this, "フィードの最終更新： —", 12f, Ui.MUTED).apply {
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        updRow.addView(updatedText)
+        val chList = Ui.text(this, "チャンネル一覧", 12.5f, Ui.TEXT, true).apply {
+            background = Ui.rounded(Ui.SURFACE, 16, this@MainActivity)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            isClickable = true
+            setOnClickListener {
+                if (currentIds.isNotEmpty()) {
+                    startActivity(Intent(this@MainActivity, ChannelListActivity::class.java).apply {
+                        putExtra("group_name", currentGroup)
+                        putStringArrayListExtra("channel_ids", ArrayList(currentIds))
+                    })
+                }
+            }
+        }
+        updRow.addView(chList)
+        val refresh = Ui.text(this, "↻", 16f, 0xFFFFB37A.toInt(), true).apply {
+            background = Ui.rounded(Ui.SURFACE, 16, this@MainActivity)
+            setPadding(dp(11), dp(4), dp(11), dp(6))
+            isClickable = true
+            setOnClickListener { if (currentIds.isNotEmpty()) selectGroup(currentGroup, currentIds) }
+        }
+        updRow.addView(refresh, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = dp(8) })
+        root.addView(updRow)
 
-        col.addView(Ui.heading(this, "グループ"))
-        val tileScroll = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
-        val tileRow = LinearLayout(this).apply {
+        // Debug row: thumbnail size (persisted; re-renders the feed rows).
+        debugRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(16), 0, dp(16), dp(4))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(16), 0)
         }
-        tileScroll.addView(tileRow)
-        col.addView(tileScroll)
+        root.addView(debugRow)
 
-        col.addView(Ui.heading(this, "新着フィード"))
-        feedAdapter = VideoAdapter(this, wide = false)
-        val feedRv = RecyclerView(this).apply {
-            layoutManager = LinearLayoutManager(this@MainActivity, LinearLayoutManager.HORIZONTAL, false)
-            adapter = feedAdapter
-            setPadding(dp(16), 0, 0, dp(8))
-            clipToPadding = false
+        status = Ui.text(this, "読み込み中…", 12.5f, Ui.MUTED).apply {
+            setPadding(dp(16), dp(6), dp(16), 0)
         }
-        col.addView(feedRv)
+        root.addView(status)
+
+        feedAdapter = VideoAdapter(this)
+        val feedRv = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = feedAdapter
+            setPadding(dp(12), 0, dp(12), dp(8))
+            clipToPadding = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
+        root.addView(feedRv)
 
         val ver = try {
             val pi = packageManager.getPackageInfo(packageName, 0)
             "v${pi.versionName} (${pi.longVersionCode})"
         } catch (e: Exception) { "" }
-        col.addView(Ui.text(this, "YT Client  $ver", 12f, Ui.MUTED).apply {
-            setPadding(dp(16), dp(20), dp(16), dp(28))
+        root.addView(Ui.text(this, "YT Client  $ver", 12f, Ui.MUTED).apply {
+            setPadding(dp(16), dp(8), dp(16), dp(14))
         })
         setContentView(root)
 
         groups = loadGroups()
-        for ((name, ids) in groups) {
-            tileRow.addView(groupTile(name, ids))
-        }
+        buildChips()
+        buildDebugRow()
         val def = groups.firstOrNull { it.first == "経済" } ?: groups.firstOrNull()
         if (def != null) selectGroup(def.first, def.second) else status.text = "グループ資産がありません"
     }
@@ -138,34 +176,53 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
-    private fun groupTile(name: String, ids: List<String>): View {
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(0, 0, dp(12), 0)
-            isClickable = true
-            setOnClickListener { selectGroup(name, ids) }
+    private fun buildChips() {
+        chipRow.removeAllViews()
+        for ((name, ids) in groups) {
+            val chip = Ui.text(this, name, 13f, if (name == currentGroup) Color.BLACK else Ui.TEXT, name == currentGroup).apply {
+                background = Ui.rounded(if (name == currentGroup) Color.WHITE else Ui.SURFACE, 18, this@MainActivity)
+                setPadding(dp(14), dp(7), dp(14), dp(7))
+                isClickable = true
+                setOnClickListener { selectGroup(name, ids) }
+            }
+            chipRow.addView(chip, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(8) })
         }
-        val tile = FrameLayout(this).apply {
-            background = Ui.rounded(Ui.SURFACE, 18, this@MainActivity)
-            layoutParams = LinearLayout.LayoutParams(dp(72), dp(72))
+    }
+
+    private fun buildDebugRow() {
+        debugRow.removeAllViews()
+        debugRow.addView(Ui.text(this, "デバッグ： サムネイル", 12f, Ui.MUTED))
+        val cur = Prefs.thumbPct(this)
+        for ((label, pct) in listOf("小" to 24, "中" to 33, "大" to 42)) {
+            val sel = pct == cur
+            val b = Ui.text(this, label, 12f, if (sel) Color.BLACK else Ui.TEXT, sel).apply {
+                background = Ui.rounded(if (sel) 0xFFFFB37A.toInt() else Ui.SURFACE, 14, this@MainActivity)
+                setPadding(dp(12), dp(5), dp(12), dp(5))
+                isClickable = true
+                setOnClickListener {
+                    Prefs.setThumbPct(this@MainActivity, pct)
+                    buildDebugRow()
+                    feedAdapter.notifyDataSetChanged()
+                }
+            }
+            debugRow.addView(b, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(8) })
         }
-        tile.addView(Ui.text(this, name.take(1), 26f, Ui.TEXT, true).apply {
-            gravity = Gravity.CENTER
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        })
-        col.addView(tile)
-        col.addView(Ui.text(this, name, 11.5f, Ui.MUTED).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, dp(4), 0, 0)
-        })
-        return col
+    }
+
+    private fun updateUpdatedLabel() {
+        val at = Prefs.feedUpdatedAt(this, currentGroup)
+        updatedText.text = "フィードの最終更新： ${if (at > 0) relTimeLabel(at) else "—"}"
     }
 
     private fun selectGroup(name: String, ids: List<String>) {
         currentGroup = name
+        currentIds = ids
+        buildChips()
+        updateUpdatedLabel()
         status.text = "「$name」の新着を取得中…"
         Bridge.call("feeds", JSONArray(ids).toString()) { data, err ->
             if (err != null || data == null) {
@@ -174,63 +231,14 @@ class MainActivity : AppCompatActivity() {
             }
             val items = Video.list(data.optJSONArray("items"))
             val errs = data.optJSONObject("errors")
+            Prefs.setFeedUpdatedAt(this, name, System.currentTimeMillis())
+            updateUpdatedLabel()
             status.text = when {
                 items.isEmpty() -> "新着がありません（エラー: $errs）"
                 errs != null && errs.length() > 0 -> "${items.size} 件 · ${errs.length()} チャンネル取得失敗"
                 else -> "${items.size} 件の新着"
             }
             feedAdapter.set(items)
-            items.firstOrNull()?.let { buildHero(it) }
         }
-    }
-
-    private fun buildHero(v: Video) {
-        heroBox.removeAllViews()
-        val iv = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        Img.load(iv, Img.thumbUrl(v.id, "maxresdefault"))
-        heroBox.addView(iv)
-        val scrim = View(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(Color.TRANSPARENT, Ui.BG)
-            )
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        heroBox.addView(scrim)
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), 0, dp(16), dp(14))
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM
-            )
-        }
-        col.addView(Ui.text(this, v.title, 21f, Ui.TEXT, true).apply { maxLines = 3 })
-        col.addView(Ui.text(this, v.meta(), 12.5f, Ui.MUTED).apply { setPadding(0, dp(4), 0, dp(10)) })
-        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val play = Ui.text(this, "▶  Play", 15f, Color.BLACK, true).apply {
-            background = Ui.rounded(Color.WHITE, 24, this@MainActivity)
-            setPadding(dp(26), dp(10), dp(26), dp(10))
-            isClickable = true
-            setOnClickListener { Ui.openDetail(this@MainActivity, v) }
-        }
-        val info = Ui.text(this, "＋   ｜   ⓘ", 15f, Ui.TEXT, true).apply {
-            background = Ui.rounded(0x66FFFFFF, 24, this@MainActivity)
-            setPadding(dp(20), dp(10), dp(20), dp(10))
-            isClickable = true
-            setOnClickListener { Ui.openDetail(this@MainActivity, v) }
-        }
-        btnRow.addView(play)
-        btnRow.addView(info, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { marginStart = dp(10) })
-        col.addView(btnRow)
-        heroBox.addView(col)
     }
 }

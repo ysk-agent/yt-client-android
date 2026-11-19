@@ -13,7 +13,6 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
-import com.google.android.material.card.MaterialCardView
 
 object Ui {
     const val BG = 0xFF0B0B10.toInt()
@@ -60,83 +59,148 @@ object Ui {
         })
     }
 
-    /** Landscape 16:9 card with title + meta underneath (streaming style). */
-    fun landscapeCard(ctx: Context, v: Video, widthDp: Int = 248): View {
-        val root = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = RecyclerView.LayoutParams(ctx.dp(widthDp), ViewGroup.LayoutParams.WRAP_CONTENT)
-            setPadding(0, 0, ctx.dp(12), 0)
-            isClickable = true
-            setOnClickListener { openDetail(ctx, v) }
-        }
-        val card = MaterialCardView(ctx).apply {
-            radius = ctx.dp(12).toFloat()
-            cardElevation = 0f
-            setCardBackgroundColor(SURFACE)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ctx.dp(widthDp * 9 / 16))
-        }
-        val iv = ImageView(ctx).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        }
-        Img.load(iv, Img.thumbUrl(v.id))
-        card.addView(iv)
-        root.addView(card)
-        root.addView(text(ctx, v.title, 14f, TEXT, true).apply {
-            maxLines = 2
-            setPadding(0, ctx.dp(6), ctx.dp(4), 0)
-        })
-        root.addView(text(ctx, v.meta(), 11.5f, MUTED).apply { maxLines = 1 })
-        return root
+    /** Sets a TextView's line height to an exact pixel value, compensating
+     * for the font's natural metrics. Text size must be set first. */
+    fun setLineHeightPx(tv: TextView, lineHeightPx: Float) {
+        val fm = tv.paint.fontMetrics
+        tv.setLineSpacing(lineHeightPx - (fm.descent - fm.ascent), 1f)
+        tv.includeFontPadding = false
     }
 
-    /** Full-width row card used by search results. */
-    fun wideCard(ctx: Context, v: Video): View {
+    fun truncateTitle(title: String, max: Int = 40): String =
+        if (title.length > max) title.substring(0, max) + "…" else title
+
+    /**
+     * The shared video row used by Home feed, Search results and Channel
+     * videos. Thumbnail is 16:9 at a debug-adjustable percentage of the row
+     * width (Prefs.thumbPct). Font sizes are derived from the thumbnail
+     * height H so the text block (title 2 lines + meta 1 line) fills H
+     * exactly, and every row in a list has the same height:
+     *   title font 0.24H / line 0.36H, meta font 0.187H / line 0.28H.
+     * Lists are expected to give the RecyclerView dp(12) horizontal padding.
+     */
+    fun videoRow(ctx: Context, v: Video): View {
+        val contentW = ctx.resources.displayMetrics.widthPixels - ctx.dp(24)
+        val thumbW = contentW * Prefs.thumbPct(ctx) / 100
+        val thumbH = thumbW * 9 / 16
+        val padV = ctx.dp(10)
+
         val root = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            setPadding(ctx.dp(16), ctx.dp(6), ctx.dp(16), ctx.dp(6))
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = RecyclerView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, thumbH + padV * 2
+            )
+            setPadding(0, padV, 0, padV)
             isClickable = true
             setOnClickListener { openDetail(ctx, v) }
         }
-        val card = MaterialCardView(ctx).apply {
-            radius = ctx.dp(12).toFloat()
-            cardElevation = 0f
-            setCardBackgroundColor(SURFACE)
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ctx.dp(196))
+
+        // Thumbnail with optional badges.
+        val thumbBox = android.widget.FrameLayout(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(thumbW, thumbH)
+            background = rounded(SURFACE, 8, ctx)
+            clipToOutline = true
         }
         val iv = ImageView(ctx).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
         }
         Img.load(iv, Img.thumbUrl(v.id))
-        card.addView(iv)
-        root.addView(card)
-        root.addView(text(ctx, v.title, 15f, TEXT, true).apply {
-            maxLines = 2
-            setPadding(0, ctx.dp(6), 0, 0)
-        })
-        val meta = text(ctx, v.meta(), 12f, MUTED)
-        root.addView(meta)
-        if (!v.channelId.isNullOrBlank() && !v.channelName.isNullOrBlank()) {
-            meta.isClickable = true
-            meta.setOnClickListener { openChannel(ctx, v.channelId!!, v.channelName) }
+        thumbBox.addView(iv)
+        fun badge(label: String, gravity: Int, bg: Int) {
+            val b = TextView(ctx).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, thumbH * 0.15f)
+                background = rounded(bg, 4, ctx)
+                setPadding(ctx.dp(5), ctx.dp(1), ctx.dp(5), ctx.dp(1))
+                layoutParams = android.widget.FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, gravity
+                ).apply { setMargins(ctx.dp(4), ctx.dp(4), ctx.dp(4), ctx.dp(4)) }
+            }
+            thumbBox.addView(b)
         }
+        if (v.isLive) {
+            badge("LIVE", Gravity.BOTTOM or Gravity.START, 0xFFC62F3B.toInt())
+        } else if (!v.duration.isNullOrBlank()) {
+            badge(v.duration!!, Gravity.BOTTOM or Gravity.END, 0xD9000000.toInt())
+        }
+        root.addView(thumbBox)
+
+        // Text column: exactly thumbH tall (2 title lines + 1 meta line).
+        val col = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, thumbH, 1f).apply { marginStart = ctx.dp(11) }
+        }
+        val titleH = (thumbH * 0.72f).toInt()
+        val metaH = thumbH - titleH
+        val title = TextView(ctx).apply {
+            text = truncateTitle(v.title)
+            setTextColor(TEXT)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, thumbH * 0.24f)
+            setTypeface(typeface, Typeface.BOLD)
+            setLineHeightPx(this, thumbH * 0.36f)
+            maxLines = 2
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, titleH)
+        }
+        col.addView(title)
+
+        // Meta: one line. Channel name ellipsizes (weighted); views + age
+        // never shrink, so they always stay visible.
+        val metaRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, metaH)
+        }
+        val metaFont = thumbH * 0.187f
+        val tail = listOfNotNull(v.views, v.published).joinToString(" ・ ")
+        if (!v.channelName.isNullOrBlank()) {
+            val ch = TextView(ctx).apply {
+                text = v.channelName
+                setTextColor(MUTED)
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, metaFont)
+                setLineHeightPx(this, thumbH * 0.28f)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            if (!v.channelId.isNullOrBlank()) {
+                ch.isClickable = true
+                ch.setOnClickListener { openChannel(ctx, v.channelId!!, v.channelName) }
+            }
+            metaRow.addView(ch)
+        }
+        if (tail.isNotBlank()) {
+            val t = TextView(ctx).apply {
+                text = if (!v.channelName.isNullOrBlank()) " ・ $tail" else tail
+                setTextColor(MUTED)
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, metaFont)
+                setLineHeightPx(this, thumbH * 0.28f)
+                maxLines = 1
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                )
+            }
+            metaRow.addView(t)
+        }
+        col.addView(metaRow)
+        root.addView(col)
         return root
     }
 }
 
-/** A RecyclerView.Adapter that builds each row view on bind. */
+/** A RecyclerView.Adapter that builds the shared video row on bind. */
 class VideoAdapter(
     private val ctx: Context,
-    private val wide: Boolean,
 ) : RecyclerView.Adapter<VideoAdapter.H>() {
     val items = ArrayList<Video>()
     class H(v: View) : RecyclerView.ViewHolder(v)
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): H {
         val container = LinearLayout(ctx).apply {
             layoutParams = RecyclerView.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
         return H(container)
@@ -145,8 +209,7 @@ class VideoAdapter(
     override fun onBindViewHolder(holder: H, position: Int) {
         val container = holder.itemView as LinearLayout
         container.removeAllViews()
-        val v = items[position]
-        container.addView(if (wide) Ui.wideCard(ctx, v) else Ui.landscapeCard(ctx, v))
+        container.addView(Ui.videoRow(ctx, items[position]))
     }
     fun set(list: List<Video>) { items.clear(); items.addAll(list); notifyDataSetChanged() }
     fun add(list: List<Video>) { val at = items.size; items.addAll(list); notifyItemRangeInserted(at, list.size) }
