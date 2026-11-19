@@ -57,9 +57,9 @@ class MainActivity : AppCompatActivity() {
         }
         input.setOnEditorActionListener { _, _, _ -> submitSearch(input.text.toString()); true }
         searchRow.addView(input)
-        searchRow.addView(go.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginStart = dp(8)
-        })
+        searchRow.addView(go, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = dp(8) })
         root.addView(searchRow)
 
         val scroll = ScrollView(this)
@@ -225,9 +225,9 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { Ui.openDetail(this@MainActivity, v) }
         }
         btnRow.addView(play)
-        btnRow.addView(info.apply {
-            (layoutParams as LinearLayout.LayoutParams).marginStart = dp(10)
-        })
+        btnRow.addView(info, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { marginStart = dp(10) })
         col.addView(btnRow)
         heroBox.addView(col)
     }
