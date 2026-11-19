@@ -26,6 +26,7 @@ class App : Application() {
             Python.start(AndroidPlatform(this))
         }
         Bridge.init(filesDir.absolutePath)
+        Img.init(cacheDir)
     }
 }
 
@@ -75,31 +76,161 @@ object Bridge {
     }
 }
 
-/** Minimal thumbnail loader with an in-memory cache (no Glide). */
+/**
+ * Thumbnail loader with two cache levels (no Glide):
+ *  1. in-memory LruCache (24 MB),
+ *  2. on-disk cache in cacheDir/thumbs — one file per URL named by the
+ *     SHA-256 hex of the URL, holding the raw downloaded JPEG bytes.
+ * Disk entries live 7 days from lastModified and the directory is capped
+ * at 100 MB (oldest files evicted first). A fresh disk hit is decoded and
+ * shown with no network access at all, so revisiting a feed on a slow
+ * connection is instant. Load order: memory -> disk (fresh) -> network.
+ * Concurrent loads of the same URL share one download/decode.
+ */
 object Img {
+    private const val TTL_MS = 7L * 24 * 60 * 60 * 1000
+    private const val CAP_BYTES = 100L * 1024 * 1024
+
     private val cache = object : LruCache<String, Bitmap>(24 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount / 1024
     }
     private val exec = Executors.newFixedThreadPool(4)
     private val main = Handler(Looper.getMainLooper())
 
+    @Volatile private var thumbsDir: java.io.File? = null
+    private val diskLock = Object()
+    /** URL -> views waiting for the one in-flight disk/network fetch. */
+    private val inFlight = HashMap<String, MutableList<ImageView>>()
+
+    /** Sets up the disk cache and runs one cleanup pass (expired files,
+     * then the size cap) on a background thread. */
+    fun init(cacheDir: java.io.File) {
+        val dir = java.io.File(cacheDir, "thumbs")
+        thumbsDir = dir
+        exec.execute {
+            synchronized(diskLock) {
+                try {
+                    if (!dir.exists()) dir.mkdirs()
+                    // Leftover temp files from interrupted writes.
+                    dir.listFiles()?.filter { it.name.contains(".tmp") }
+                        ?.forEach { it.delete() }
+                    pruneLocked()
+                } catch (e: Exception) { /* cache is best-effort */ }
+            }
+        }
+    }
+
     fun thumbUrl(videoId: String, size: String = "hqdefault") =
         "https://i.ytimg.com/vi/$videoId/$size.jpg"
+
+    private fun fileFor(url: String): java.io.File? {
+        val dir = thumbsDir ?: return null
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(url.toByteArray(Charsets.UTF_8))
+        val hex = digest.joinToString("") { "%02x".format(it) }
+        return java.io.File(dir, "$hex.jpg")
+    }
+
+    private fun isFresh(f: java.io.File): Boolean =
+        f.exists() && System.currentTimeMillis() - f.lastModified() < TTL_MS
+
+    /** Deletes expired entries, then evicts oldest-first until the total
+     * size is under the cap. Caller must hold diskLock. */
+    private fun pruneLocked() {
+        val dir = thumbsDir ?: return
+        val files = dir.listFiles()?.filter { it.isFile && it.name.endsWith(".jpg") }
+            ?: return
+        val now = System.currentTimeMillis()
+        val alive = files.filter { f ->
+            if (now - f.lastModified() >= TTL_MS) { f.delete(); false } else true
+        }
+        var total = alive.sumOf { it.length() }
+        if (total <= CAP_BYTES) return
+        for (f in alive.sortedBy { it.lastModified() }) {
+            if (total <= CAP_BYTES) break
+            val len = f.length()
+            if (f.delete()) total -= len
+        }
+    }
+
+    /** Decodes [f] downsampled so the result is ~320–640 px wide
+     * (hqdefault sources are 480x360, which pass through unsampled). */
+    private fun decodeSampled(f: java.io.File): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(f.absolutePath, bounds)
+        if (bounds.outWidth <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= 320) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        return BitmapFactory.decodeFile(f.absolutePath, opts)
+    }
+
+    /** Downloads [url] into [dest] atomically: bytes go to a temp file in
+     * the same directory and are renamed into place only on success. */
+    private fun download(url: String, dest: java.io.File): Boolean {
+        val tmp = java.io.File(dest.parentFile, dest.name + ".tmp-" + System.nanoTime())
+        return try {
+            dest.parentFile?.mkdirs()
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 8000; conn.readTimeout = 8000
+            if (conn.responseCode != HttpURLConnection.HTTP_OK) {
+                tmp.delete(); return false
+            }
+            conn.inputStream.use { input ->
+                java.io.FileOutputStream(tmp).use { input.copyTo(it) }
+            }
+            if (tmp.length() <= 0L) { tmp.delete(); return false }
+            synchronized(diskLock) {
+                if (!tmp.renameTo(dest)) { tmp.delete(); return false }
+                pruneLocked()
+            }
+            true
+        } catch (e: Exception) {
+            tmp.delete()
+            false
+        }
+    }
 
     fun load(iv: ImageView, url: String) {
         iv.tag = url
         cache.get(url)?.let { iv.setImageBitmap(it); return }
         iv.setImageBitmap(null)
+        // In-flight dedup: if this URL is already being fetched, just
+        // queue this view for the shared result.
+        synchronized(inFlight) {
+            val waiters = inFlight[url]
+            if (waiters != null) { waiters.add(iv); return }
+            inFlight[url] = mutableListOf(iv)
+        }
         exec.execute {
             var bmp: Bitmap? = null
             try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 8000; conn.readTimeout = 8000
-                conn.inputStream.use { bmp = BitmapFactory.decodeStream(it) }
+                val file = fileFor(url)
+                if (file != null && isFresh(file)) {
+                    bmp = decodeSampled(file)
+                    if (bmp == null) {
+                        // Corrupt entry: drop it and fall through to network.
+                        synchronized(diskLock) { file.delete() }
+                    }
+                }
+                if (bmp == null && file != null) {
+                    if (download(url, file)) bmp = decodeSampled(file)
+                }
+                if (bmp == null && file == null) {
+                    // Disk cache not initialised: plain network decode.
+                    val conn = URL(url).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 8000; conn.readTimeout = 8000
+                    conn.inputStream.use { bmp = BitmapFactory.decodeStream(it) }
+                }
             } catch (e: Exception) { /* leave placeholder */ }
             val b = bmp
             if (b != null) cache.put(url, b)
-            main.post { if (iv.tag == url && b != null) iv.setImageBitmap(b) }
+            val targets = synchronized(inFlight) { inFlight.remove(url) } ?: emptyList()
+            if (b != null) {
+                main.post {
+                    for (v in targets) if (v.tag == url) v.setImageBitmap(b)
+                }
+            }
         }
     }
 }
