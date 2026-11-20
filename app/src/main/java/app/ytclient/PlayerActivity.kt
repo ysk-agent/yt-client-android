@@ -17,6 +17,14 @@ import java.io.ByteArrayInputStream
  * Provisional in-app player (v0.1.9, 仮追加): a full-screen WebView on the
  * YouTube embed player, plus request-level ad blocking.
  *
+ * v0.1.10: the embed is no longer loaded with a bare loadUrl(). Since 2025
+ * YouTube's embedded player requires a Referer from the embedding context;
+ * a direct navigation sends none and the player shows
+ * 「動画プレーヤーの設定エラー」 (error 153). Instead a minimal local HTML
+ * wrapper is loaded with base URL https://www.youtube.com, and an <iframe>
+ * inside it loads the embed — that request carries
+ * Referer: https://www.youtube.com/ and plays.
+ *
  * The blocking realises what "AdGuard DNS" would do — sinkhole the ad /
  * tracker domains — at the WebView request layer instead of the DNS layer,
  * because an app cannot take over DNS for just itself and the device's
@@ -53,9 +61,35 @@ class PlayerActivity : AppCompatActivity() {
         webView = wv
         setContentView(wv)
         if (videoId.isNotBlank()) {
-            wv.loadUrl("https://www.youtube.com/embed/$videoId?autoplay=1&playsinline=1&rel=0")
+            val embedUrl =
+                "https://www.youtube.com/embed/$videoId?autoplay=1&playsinline=1&rel=0"
+            wv.loadDataWithBaseURL(
+                "https://www.youtube.com",
+                wrapperHtml(embedUrl),
+                "text/html",
+                "UTF-8",
+                null,
+            )
         }
     }
+
+    /** Minimal black full-viewport page holding only the embed iframe. */
+    private fun wrapperHtml(embedUrl: String): String = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          html, body { margin: 0; padding: 0; background: #000; height: 100%; }
+          iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0; }
+        </style>
+        </head>
+        <body>
+        <iframe src="$embedUrl" frameborder="0" allowfullscreen
+          allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+        </body>
+        </html>
+    """.trimIndent()
 
     override fun onPause() {
         webView?.onPause()
@@ -78,6 +112,29 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private inner class AdBlockClient : WebViewClient() {
+        override fun onPageFinished(view: WebView, url: String?) {
+            super.onPageFinished(view, url)
+            // Error-153 probe: once the wrapper has loaded, look inside the
+            // iframe document (same origin as the wrapper's base URL) for
+            // the error page signature and log the state, so a working
+            // player is distinguishable from the 「設定エラー」 page in
+            // logcat / CI. Log-only; never affects playback.
+            for (delayMs in PROBE_DELAYS_MS) {
+                view.postDelayed({ probePlayerState(view) }, delayMs)
+            }
+        }
+
+        private fun probePlayerState(view: WebView) {
+            if (webView == null) return
+            try {
+                view.evaluateJavascript(PROBE_JS) { result ->
+                    Log.d(PROBE_TAG, "state=$result")
+                }
+            } catch (e: Exception) {
+                Log.d(PROBE_TAG, "state=probe-failed ${e.message}")
+            }
+        }
+
         override fun shouldInterceptRequest(
             view: WebView,
             request: WebResourceRequest,
@@ -99,6 +156,32 @@ class PlayerActivity : AppCompatActivity() {
 
     private companion object {
         const val TAG = "YtAdBlock"
+        const val PROBE_TAG = "YtPlayerProbe"
+
+        /** Delays after the wrapper's onPageFinished at which the iframe
+         *  state is probed; the embed player settles asynchronously. */
+        val PROBE_DELAYS_MS = longArrayOf(4_000L, 10_000L, 20_000L)
+
+        /**
+         * Runs in the wrapper page and classifies the iframe's document:
+         * "error153" when the error page signature (.ytp-error element or
+         * the 設定エラー / エラー 153 text) is present, "player" when the
+         * HTML5 player element exists, otherwise "unknown". The result
+         * reaches the evaluateJavascript callback JSON-quoted.
+         */
+        val PROBE_JS = """
+            (function(){try{
+              var f=document.querySelector('iframe');
+              if(!f) return 'no-iframe';
+              var d=f.contentDocument;
+              if(!d) return 'no-doc';
+              if(d.querySelector('.ytp-error')) return 'error153';
+              var t=(d.body&&d.body.innerText)||'';
+              if(/(設定エラー|エラー\s*153|error\s*153)/i.test(t)) return 'error153';
+              if(d.querySelector('.html5-video-player')||d.getElementById('movie_player')) return 'player';
+              return 'unknown';
+            }catch(e){return 'exc';}})()
+        """.trimIndent()
 
         /**
          * Host suffixes AdGuard DNS is known to sinkhole: ad serving and

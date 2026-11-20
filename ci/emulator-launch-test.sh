@@ -58,9 +58,27 @@ check_top DetailActivity "DetailActivity launch"
 screencap screenshot-detail.png
 
 adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
-sleep 10
+# Let the embed settle: the app's error-153 probes fire up to ~20 s after
+# the wrapper page finishes, and the player itself loads asynchronously.
+sleep 35
 check_top PlayerActivity "PlayerActivity launch"
 screencap screenshot-player.png
+# Error-153 evidence: PlayerActivity probes the iframe document state and
+# logs it under YtPlayerProbe; the ad blocker logs under YtAdBlock. A
+# positive error-153 detection fails the run (the Referer fix is part of
+# what is being tested); an inconclusive probe only warns, since YouTube
+# may simply be unreachable from the emulator.
+adb logcat -d -s YtPlayerProbe:D YtAdBlock:D > player-probe.txt 2>&1 || true
+echo "--- player probe / adblock log ---"; cat player-probe.txt
+if grep -q "error153" player-probe.txt; then
+  note_fail "error 153 page detected in PlayerActivity (Referer fix not effective)"
+elif grep -q 'state="player"' player-probe.txt; then
+  echo "OK: player probe reports a working player (no error 153)"
+else
+  echo "PLAYER PROBE INCONCLUSIVE: no probe verdict in logcat (YouTube may be unreachable)"
+fi
+BLOCKED=$(grep -c "blocked #" player-probe.txt || true)
+echo "adblock: $BLOCKED blocked request(s) logged so far"
 
 adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG_Japan"
 sleep 15
