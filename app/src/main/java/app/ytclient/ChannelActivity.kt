@@ -8,12 +8,19 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import org.json.JSONArray
 
 class ChannelActivity : AppCompatActivity() {
     private lateinit var adapter: VideoAdapter
     private lateinit var status: TextView
+    private lateinit var scroll: ScrollView
+    private lateinit var col: LinearLayout
     private var continuation: String? = null
     private var loading = false
+    /** True while the list shows the Atom feed's first page. The browse
+     * (channel) fetch happens lazily, only when the user scrolls toward
+     * the end of that page and page 2+ is actually wanted. */
+    private var feedPhase = true
     private var channelId: String = ""
     private var channelName: String = ""
 
@@ -21,12 +28,12 @@ class ChannelActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         channelId = intent.getStringExtra("channel_id") ?: ""
         channelName = intent.getStringExtra("channel_name") ?: ""
-        val scroll = ScrollView(this).apply {
+        scroll = ScrollView(this).apply {
             setBackgroundColor(Ui.BG)
             val sb = resources.getIdentifier("status_bar_height", "dimen", "android")
             setPadding(0, if (sb > 0) resources.getDimensionPixelSize(sb) else 0, 0, 0)
         }
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scroll.addView(col)
 
         val nameView = Ui.text(this, channelName.ifBlank { "チャンネル" }, 22f, Ui.TEXT, true).apply {
@@ -62,8 +69,7 @@ class ChannelActivity : AppCompatActivity() {
         col.addView(status)
         setContentView(scroll)
 
-        // Page 2+ loads when the scroll nears the bottom of the list.
-        scroll.setOnScrollChangeListener { _, _, _, _, _ -> maybeLoadMore(scroll, col) }
+        scroll.setOnScrollChangeListener { _, _, _, _, _ -> maybeLoadMore() }
 
         Bridge.call("channel_info", channelId) { data, err ->
             if (err != null || data == null) {
@@ -79,35 +85,65 @@ class ChannelActivity : AppCompatActivity() {
             ).joinToString(" · ")
             descView.text = if (data.isNull("description")) "" else data.optString("description")
         }
+
+        // Page 1 is the Atom feed: one light GET, the same source as the
+        // home feed. The channel (browse) fetch is deferred until page 2+
+        // is wanted (see bootstrapBrowse).
         loading = true
+        Bridge.call("feeds", JSONArray(listOf(channelId)).toString()) { data, err ->
+            loading = false
+            if (err != null || data == null) {
+                // Feed failed: fall back to the browse first page so the
+                // screen still works.
+                bootstrapBrowse()
+                return@call
+            }
+            val items = Video.list(data.optJSONArray("items")).filter { !it.isShorts }
+            adapter.set(items)
+            status.text = "全 ${adapter.itemCount} 件"
+            if (items.isEmpty()) {
+                bootstrapBrowse()
+            } else {
+                scroll.post { maybeLoadMore() }
+            }
+        }
+    }
+
+    /** Fires when the visible bottom comes within ~400dp of the content
+     * end. In the feed phase that means page 2+ is wanted, so the browse
+     * cursor is fetched first; afterwards pages continue via
+     * channel_videos_next. The feed is never used beyond page 1. */
+    private fun maybeLoadMore() {
+        if (loading) return
+        val remaining = col.height - (scroll.scrollY + scroll.height)
+        if (remaining >= dp(400)) return
+        if (feedPhase) bootstrapBrowse()
+        else if (continuation != null) loadNext()
+    }
+
+    /** Fetches browse page 1 to obtain the continuation cursor, and
+     * replaces the feed list with it (browse page 1 is a superset of the
+     * feed page and carries durations). */
+    private fun bootstrapBrowse() {
+        if (loading) return
+        loading = true
+        status.text = "続きを読み込み中…"
         Bridge.call("channel_videos", channelId, "latest") { data, err ->
             loading = false
             if (err != null || data == null) {
-                status.text = "動画エラー: $err"
+                status.text = "ページングエラー: $err"
                 return@call
             }
-            // No Shorts section: shorts items are dropped here too, in
-            // case a browse page mixes them into the videos tab.
+            feedPhase = false
             val items = Video.list(data.optJSONArray("items")).filter { it.kind == "video" }
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
             adapter.set(items)
             status.text = "全 ${adapter.itemCount} 件"
-            // A short first page may not fill the screen; pull the next
-            // page right away in that case (no scroll event would fire).
-            scroll.post { maybeLoadMore(scroll, col) }
+            scroll.post { maybeLoadMore() }
         }
     }
 
-    /** Loads the next page when the visible bottom is within ~400dp of
-     * the content end. Pages 2+ always come from the channel client's
-     * browse continuation (channel_videos_next), never from the feed. */
-    private fun maybeLoadMore(scroll: ScrollView, col: LinearLayout) {
-        if (loading || continuation == null) return
-        val remaining = col.height - (scroll.scrollY + scroll.height)
-        if (remaining < dp(400)) loadNext(scroll, col)
-    }
-
-    private fun loadNext(scroll: ScrollView, col: LinearLayout) {
+    private fun loadNext() {
         val cont = continuation ?: return
         loading = true
         status.text = "続きを読み込み中…"
@@ -121,7 +157,7 @@ class ChannelActivity : AppCompatActivity() {
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
             adapter.add(items)
             status.text = "全 ${adapter.itemCount} 件"
-            scroll.post { maybeLoadMore(scroll, col) }
+            scroll.post { maybeLoadMore() }
         }
     }
 }
