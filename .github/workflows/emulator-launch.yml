@@ -62,6 +62,7 @@ jobs:
             screenshot-main.png
             screenshot-search.png
             screenshot-detail.png
+            screenshot-player.png
             screenshot-channel.png
             screenshot-channellist.png
           if-no-files-found: warn

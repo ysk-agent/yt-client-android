@@ -3,6 +3,7 @@ package app.ytclient
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -103,6 +104,26 @@ class DetailActivity : AppCompatActivity() {
                 setPadding(dp(16), dp(10), dp(16), 0)
                 maxLines = 6
             })
+        }
+
+        // Provisional WebView player (v0.1.9): always available, unlike the
+        // subtitle action buttons below — playback needs no captions.
+        val playBtn = Ui.text(this, "▶ 再生（仮）", 14f, Ui.TEXT, true).apply {
+            background = Ui.rounded(Ui.SURFACE, 10, this@DetailActivity)
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            isClickable = true
+            setOnClickListener {
+                startActivity(Intent(this@DetailActivity, PlayerActivity::class.java).apply {
+                    putExtra("video_id", videoId)
+                    putExtra("title", title)
+                })
+            }
+        }
+        col.addView(playBtn)
+        (playBtn.layoutParams as LinearLayout.LayoutParams).apply {
+            width = ViewGroup.LayoutParams.MATCH_PARENT
+            setMargins(dp(16), dp(14), dp(16), 0)
         }
 
         col.addView(Ui.heading(this, "字幕トラック"))

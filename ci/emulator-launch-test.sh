@@ -57,6 +57,11 @@ sleep 15
 check_top DetailActivity "DetailActivity launch"
 screencap screenshot-detail.png
 
+adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
+sleep 10
+check_top PlayerActivity "PlayerActivity launch"
+screencap screenshot-player.png
+
 adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG_Japan"
 sleep 15
 check_top ChannelActivity "ChannelActivity launch"
