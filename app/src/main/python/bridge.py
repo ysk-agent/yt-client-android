@@ -105,6 +105,24 @@ def search_next(continuation: str) -> str:
 
 # -- channel ----------------------------------------------------------------
 
+def _channel_items(page, channel_id: str, channel_name: str = "") -> list:
+    items = []
+    name = channel_name
+    if not name and page.channel is not None and page.channel.name:
+        name = page.channel.name
+    for item in page.items:
+        if item.kind == "shorts":
+            continue
+        d = _encode(item)
+        # Browse items carry no channel identity of their own;
+        # stamp it so rows can show the channel name.
+        d["channel_id"] = channel_id
+        if name:
+            d["channel_name"] = name
+        items.append(d)
+    return items
+
+
 def channel_videos(channel_id: str, sort: str = "latest") -> str:
     async def go():
         from yt_channel import YoutubeChannelClient
@@ -113,19 +131,30 @@ def channel_videos(channel_id: str, sort: str = "latest") -> str:
             hl="ja", gl="JP", state_file=_state("yt_channel")
         ) as c:
             page = await c.videos(channel_id, sort=sort)
-            items = []
-            for item in page.items:
-                if item.kind == "shorts":
-                    continue
-                d = _encode(item)
-                # Browse items carry no channel identity of their own;
-                # stamp it so rows can show the channel name.
-                d["channel_id"] = channel_id
-                if page.channel is not None and page.channel.name:
-                    d["channel_name"] = page.channel.name
-                items.append(d)
             return {
-                "items": items,
+                "items": _channel_items(page, channel_id),
+                "continuation": page.continuation,
+                "channel": page.channel,
+            }
+
+    return _run(go)
+
+
+def channel_videos_next(
+    continuation: str, channel_id: str, channel_name: str = ""
+) -> str:
+    """Page 2+ of a channel's videos: always the channel client's browse
+    continuation, never the Atom feed (the feed has no paging and only
+    carries the latest items)."""
+    async def go():
+        from yt_channel import YoutubeChannelClient
+
+        async with YoutubeChannelClient(
+            hl="ja", gl="JP", state_file=_state("yt_channel")
+        ) as c:
+            page = await c.next_page(continuation)
+            return {
+                "items": _channel_items(page, channel_id, channel_name),
                 "continuation": page.continuation,
                 "channel": page.channel,
             }
