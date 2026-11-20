@@ -59,6 +59,7 @@ jobs:
           path: |
             logcat.txt
             player-probe.txt
+            player-window-dump.xml
             window_dump.xml
             screenshot-main.png
             screenshot-search.png

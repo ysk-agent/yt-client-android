@@ -58,24 +58,33 @@ check_top DetailActivity "DetailActivity launch"
 screencap screenshot-detail.png
 
 adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
-# Let the embed settle: the app's error-153 probes fire up to ~20 s after
-# the wrapper page finishes, and the player itself loads asynchronously.
+# Let the embed settle: the player loads asynchronously and its
+# postMessage events (ready / state changes / errors) arrive over time.
 sleep 35
 check_top PlayerActivity "PlayerActivity launch"
 screencap screenshot-player.png
-# Error-153 evidence: PlayerActivity probes the iframe document state and
-# logs it under YtPlayerProbe; the ad blocker logs under YtAdBlock. A
-# positive error-153 detection fails the run (the Referer fix is part of
-# what is being tested); an inconclusive probe only warns, since YouTube
-# may simply be unreachable from the emulator.
+# Player verdict evidence. The wrapper page is cross-origin to the embed
+# iframe, so its DOM cannot be inspected; instead the player posts events
+# (enablejsapi=1) which the app forwards to logcat under YtPlayerProbe,
+# and the rendered UI is dumped with uiautomator for the error-card text
+# ("This video is unavailable" / "Error code: 152" / 「設定エラー」).
+# A positively detected error fails the run — distinguishing the error
+# page from a working player is the point of this section. No verdict at
+# all only warns: YouTube may simply be unreachable from the emulator.
+dismiss_anr
+adb shell uiautomator dump /sdcard/player_window_dump.xml >/dev/null 2>&1 || true
+adb pull /sdcard/player_window_dump.xml player-window-dump.xml >/dev/null 2>&1 || true
 adb logcat -d -s YtPlayerProbe:D YtAdBlock:D > player-probe.txt 2>&1 || true
 echo "--- player probe / adblock log ---"; cat player-probe.txt
-if grep -q "error153" player-probe.txt; then
-  note_fail "error 153 page detected in PlayerActivity (Referer fix not effective)"
-elif grep -q 'state="player"' player-probe.txt; then
-  echo "OK: player probe reports a working player (no error 153)"
+PLAYER_ERR=0
+grep -q '"event":"onError"' player-probe.txt && PLAYER_ERR=1
+grep -qiE "Error code|unavailable|設定エラー|利用できません" player-window-dump.xml 2>/dev/null && PLAYER_ERR=1
+if [ "$PLAYER_ERR" -eq 1 ]; then
+  note_fail "player shows an error card (see player-probe.txt, player-window-dump.xml, screenshot-player.png)"
+elif grep -qE 'playerState\\?": ?1|onStateChange' player-probe.txt; then
+  echo "OK: player reports playback (no error card)"
 else
-  echo "PLAYER PROBE INCONCLUSIVE: no probe verdict in logcat (YouTube may be unreachable)"
+  echo "PLAYER VERDICT INCONCLUSIVE: no error detected, but no playback state either"
 fi
 BLOCKED=$(grep -c "blocked #" player-probe.txt || true)
 echo "adblock: $BLOCKED blocked request(s) logged so far"

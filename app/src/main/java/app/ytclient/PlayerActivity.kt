@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -18,12 +19,17 @@ import java.io.ByteArrayInputStream
  * YouTube embed player, plus request-level ad blocking.
  *
  * v0.1.10: the embed is no longer loaded with a bare loadUrl(). Since 2025
- * YouTube's embedded player requires a Referer from the embedding context;
+ * YouTube's embedded player requires a Referer identifying the embedder:
  * a direct navigation sends none and the player shows
- * 「動画プレーヤーの設定エラー」 (error 153). Instead a minimal local HTML
- * wrapper is loaded with base URL https://www.youtube.com, and an <iframe>
- * inside it loads the embed — that request carries
- * Referer: https://www.youtube.com/ and plays.
+ * 「動画プレーヤーの設定エラー」 (error 153). A minimal local HTML wrapper
+ * is therefore loaded via loadDataWithBaseURL and an <iframe> inside it
+ * loads the embed. The base URL must NOT be https://www.youtube.com
+ * itself: a page claiming to be youtube.com hosting a youtube.com iframe
+ * is rejected as an invalid embed context ("This video is unavailable",
+ * error 152 — verified in CI). YouTube's documented identity form for
+ * native apps is https://<applicationId>, so the base URL is
+ * https://app.ytclient: the iframe request then carries
+ * Referer: https://app.ytclient, a legitimate third-party embedder.
  *
  * The blocking realises what "AdGuard DNS" would do — sinkhole the ad /
  * tracker domains — at the WebView request layer instead of the DNS layer,
@@ -57,14 +63,15 @@ class PlayerActivity : AppCompatActivity() {
                 mediaPlaybackRequiresUserGesture = false
             }
             webViewClient = AdBlockClient()
+            addJavascriptInterface(ProbeBridge(), "YtProbe")
         }
         webView = wv
         setContentView(wv)
         if (videoId.isNotBlank()) {
-            val embedUrl =
-                "https://www.youtube.com/embed/$videoId?autoplay=1&playsinline=1&rel=0"
+            val embedUrl = "https://www.youtube.com/embed/$videoId" +
+                "?autoplay=1&playsinline=1&rel=0&enablejsapi=1&origin=$BASE_URL"
             wv.loadDataWithBaseURL(
-                "https://www.youtube.com",
+                BASE_URL,
                 wrapperHtml(embedUrl),
                 "text/html",
                 "UTF-8",
@@ -73,7 +80,15 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    /** Minimal black full-viewport page holding only the embed iframe. */
+    /**
+     * Minimal black full-viewport page holding only the embed iframe, plus
+     * a listener for the player's postMessage events (enabled by
+     * enablejsapi=1): every event the iframe posts is forwarded to the
+     * YtProbe bridge so the player state — ready, playing, or an error
+     * code — is observable in logcat. The wrapper is cross-origin to the
+     * iframe, so DOM inspection of the player is impossible by design;
+     * these events are the probe channel.
+     */
     private fun wrapperHtml(embedUrl: String): String = """
         <!DOCTYPE html>
         <html>
@@ -85,11 +100,40 @@ class PlayerActivity : AppCompatActivity() {
         </style>
         </head>
         <body>
-        <iframe src="$embedUrl" frameborder="0" allowfullscreen
+        <iframe id="player" src="$embedUrl" frameborder="0" allowfullscreen
           allow="autoplay; encrypted-media; picture-in-picture"></iframe>
+        <script>
+          function ytLog(s) { try { if (window.YtProbe) YtProbe.log(s); } catch (e) {} }
+          window.addEventListener('message', function (e) {
+            if (e.origin !== 'https://www.youtube.com') return;
+            ytLog('msg ' + (typeof e.data === 'string' ? e.data : JSON.stringify(e.data)));
+          });
+          var f = document.getElementById('player');
+          function subscribe() {
+            try {
+              f.contentWindow.postMessage(
+                JSON.stringify({event: 'listening', id: 'ytclient', channel: 'widget'}),
+                'https://www.youtube.com');
+            } catch (e) {}
+          }
+          f.addEventListener('load', function () {
+            subscribe();
+            setTimeout(subscribe, 2000);
+            setTimeout(subscribe, 5000);
+          });
+          ytLog('wrapper ready');
+        </script>
         </body>
         </html>
     """.trimIndent()
+
+    /** Receives the wrapper's player-event log lines. Log-only. */
+    private inner class ProbeBridge {
+        @JavascriptInterface
+        fun log(message: String) {
+            Log.d(PROBE_TAG, message.take(500))
+        }
+    }
 
     override fun onPause() {
         webView?.onPause()
@@ -112,29 +156,6 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private inner class AdBlockClient : WebViewClient() {
-        override fun onPageFinished(view: WebView, url: String?) {
-            super.onPageFinished(view, url)
-            // Error-153 probe: once the wrapper has loaded, look inside the
-            // iframe document (same origin as the wrapper's base URL) for
-            // the error page signature and log the state, so a working
-            // player is distinguishable from the 「設定エラー」 page in
-            // logcat / CI. Log-only; never affects playback.
-            for (delayMs in PROBE_DELAYS_MS) {
-                view.postDelayed({ probePlayerState(view) }, delayMs)
-            }
-        }
-
-        private fun probePlayerState(view: WebView) {
-            if (webView == null) return
-            try {
-                view.evaluateJavascript(PROBE_JS) { result ->
-                    Log.d(PROBE_TAG, "state=$result")
-                }
-            } catch (e: Exception) {
-                Log.d(PROBE_TAG, "state=probe-failed ${e.message}")
-            }
-        }
-
         override fun shouldInterceptRequest(
             view: WebView,
             request: WebResourceRequest,
@@ -158,30 +179,14 @@ class PlayerActivity : AppCompatActivity() {
         const val TAG = "YtAdBlock"
         const val PROBE_TAG = "YtPlayerProbe"
 
-        /** Delays after the wrapper's onPageFinished at which the iframe
-         *  state is probed; the embed player settles asynchronously. */
-        val PROBE_DELAYS_MS = longArrayOf(4_000L, 10_000L, 20_000L)
-
         /**
-         * Runs in the wrapper page and classifies the iframe's document:
-         * "error153" when the error page signature (.ytp-error element or
-         * the 設定エラー / エラー 153 text) is present, "player" when the
-         * HTML5 player element exists, otherwise "unknown". The result
-         * reaches the evaluateJavascript callback JSON-quoted.
+         * Origin the wrapper page is served from, hence the Referer the
+         * embed request carries. YouTube's documented client-identity form
+         * for native apps is https://<applicationId>. Deliberately NOT
+         * https://www.youtube.com: claiming to be youtube.com itself is
+         * rejected with error 152 (see the class doc).
          */
-        val PROBE_JS = """
-            (function(){try{
-              var f=document.querySelector('iframe');
-              if(!f) return 'no-iframe';
-              var d=f.contentDocument;
-              if(!d) return 'no-doc';
-              if(d.querySelector('.ytp-error')) return 'error153';
-              var t=(d.body&&d.body.innerText)||'';
-              if(/(設定エラー|エラー\s*153|error\s*153)/i.test(t)) return 'error153';
-              if(d.querySelector('.html5-video-player')||d.getElementById('movie_player')) return 'player';
-              return 'unknown';
-            }catch(e){return 'exc';}})()
-        """.trimIndent()
+        const val BASE_URL = "https://app.ytclient"
 
         /**
          * Host suffixes AdGuard DNS is known to sinkhole: ad serving and
