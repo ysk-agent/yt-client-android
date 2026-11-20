@@ -170,6 +170,49 @@ else
   echo "SPEED VERDICT INCONCLUSIVE: playback/rate setup not observed (YouTube unreachable from the emulator?)"
 fi
 
+# --- v0.1.12: paused player must NOT enter PiP (autoEnter=false leg) ---
+# A fresh player is started, playback is confirmed, then the embed is
+# paused by tapping the video (the embed toggles play/pause on tap).
+# Pressing Home while paused must leave the app in the background with
+# no PiP. If the tap never produces a paused state in the probe log the
+# leg is inconclusive rather than a failure: the tap target inside the
+# cross-origin embed cannot be addressed precisely.
+adb shell am force-stop $PKG || true
+sleep 2
+adb logcat -c || true
+adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
+PAUSED_SETUP=0
+for i in $(seq 1 14); do
+  sleep 5
+  adb logcat -d -s YtPlayerProbe:D > probe-pause-setup.txt 2>&1 || true
+  grep -qE 'playerState\\?": ?1' probe-pause-setup.txt && break
+done
+if grep -qE 'playerState\\?": ?1' probe-pause-setup.txt; then
+  for t in 1 2 3; do
+    adb shell input tap 540 1100 || true
+    sleep 4
+    adb logcat -d -s YtPlayerProbe:D > probe-pause-setup.txt 2>&1 || true
+    if grep -qE 'playerState\\?": ?2' probe-pause-setup.txt; then PAUSED_SETUP=1; break; fi
+  done
+fi
+echo "paused scenario setup: paused=$PAUSED_SETUP"
+if [ "$PAUSED_SETUP" -eq 1 ]; then
+  adb logcat -c || true
+  sleep 1
+  adb shell input keyevent KEYCODE_HOME
+  sleep 6
+  adb logcat -d -s YtPlayerProbe:D > probe-paused-home.txt 2>&1 || true
+  echo "--- paused-home evidence (probe) ---"
+  grep -E "userLeaveHint|pip enter|pip mode" probe-paused-home.txt | tail -5 || true
+  if grep -q "pip mode changed: true" probe-paused-home.txt; then
+    note_fail "paused player entered PiP (autoEnter=false path broken)"
+  else
+    echo "OK: paused player did not enter PiP on Home"
+  fi
+else
+  echo "PAUSED-PIP VERDICT INCONCLUSIVE: could not drive the embed into a paused state via taps"
+fi
+
 adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG_Japan"
 sleep 15
 check_top ChannelActivity "ChannelActivity launch"

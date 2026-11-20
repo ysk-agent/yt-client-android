@@ -51,9 +51,21 @@ import java.io.ByteArrayInputStream
  *
  * v0.1.11: Picture-in-Picture and the playback-rate reset fix.
  * PiP: pressing Home / switching away while a video plays enters PiP
- * (onUserLeaveHint) with a single play/pause RemoteAction; leaving via
- * Back still finishes the activity. While in PiP the WebView is not
- * paused, so playback continues in the small window.
+ * with a single play/pause RemoteAction; leaving via Back still
+ * finishes the activity. While in PiP the WebView is not paused, so
+ * playback continues in the small window.
+ *
+ * v0.1.12: PiP entry switches to the Android 12+ auto-enter mechanism.
+ * On the user's device (Android 15) the manual enterPictureInPictureMode
+ * call from onUserLeaveHint proved unreliable: the home transition's
+ * recents/gesture machinery starts pausing the activity before the call
+ * lands, and the platform returned false even with the player playing
+ * (device logcat, 2026-11-20). With auto-enter, the PiP params carry
+ * setAutoEnterEnabled(isPlaying()) — refreshed on every playing-state
+ * flip through buildPipParams() — and the system itself performs the
+ * PiP transition as part of the leave, so there is no call to race.
+ * The manual call in onUserLeaveHint remains as the only path on
+ * API 26–30 and as a harmless fallback on 31+.
  * Rate fix: the embed player silently resets its playbackRate to 1x
  * while the app is backgrounded, even though its settings UI keeps
  * showing the user's chosen rate. The app therefore tracks the rate the
@@ -298,10 +310,19 @@ class PlayerActivity : AppCompatActivity() {
                     android.app.PendingIntent.FLAG_IMMUTABLE,
             ),
         )
-        return PictureInPictureParams.Builder()
+        val builder = PictureInPictureParams.Builder()
             .setAspectRatio(Rational(16, 9))
             .setActions(listOf(action))
-            .build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Auto-enter (v0.1.12): the system enters PiP itself during
+            // the home transition while this flag is on, instead of the
+            // app racing the transition with a manual call. The flag
+            // tracks isPlaying() because every params refresh — the
+            // initial set in onCreate and every playing-state flip —
+            // goes through this builder.
+            builder.setAutoEnterEnabled(playing)
+        }
+        return builder.build()
     }
 
     override fun onUserLeaveHint() {
@@ -314,6 +335,9 @@ class PlayerActivity : AppCompatActivity() {
             "userLeaveHint: video=${videoId.isNotBlank()} state=$lastPlayerState playing=${isPlaying()}",
         )
         if (videoId.isBlank() || !isPlaying()) return
+        // Fallback only: on API 31+ auto-enter (buildPipParams) normally
+        // performs the transition itself; this manual call is the sole
+        // path on API 26–30 and a no-op/false once auto-enter has fired.
         val entered = try {
             enterPictureInPictureMode(buildPipParams())
         } catch (e: Exception) {
