@@ -1,9 +1,19 @@
 package app.ytclient
 
 import android.annotation.SuppressLint
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.drawable.Icon
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.util.Rational
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
@@ -12,6 +22,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 
 /**
@@ -36,19 +47,60 @@ import java.io.ByteArrayInputStream
  * because an app cannot take over DNS for just itself and the device's
  * VpnService slot is already occupied by Moka VPN. Blocked requests get an
  * empty 204 response; everything else (above all the video stream hosts)
- * is left alone. No PiP, no background playback, no speed control: those
- * stay yt-player's job.
+ * is left alone.
+ *
+ * v0.1.11: Picture-in-Picture and the playback-rate reset fix.
+ * PiP: pressing Home / switching away while a video plays enters PiP
+ * (onUserLeaveHint) with a single play/pause RemoteAction; leaving via
+ * Back still finishes the activity. While in PiP the WebView is not
+ * paused, so playback continues in the small window.
+ * Rate fix: the embed player silently resets its playbackRate to 1x
+ * while the app is backgrounded, even though its settings UI keeps
+ * showing the user's chosen rate. The app therefore tracks the rate the
+ * player reports WHILE THIS ACTIVITY IS IN THE FOREGROUND (that is the
+ * rate the user actually chose) and re-applies it with setPlaybackRate
+ * whenever the activity returns to the foreground. Rate reports that
+ * arrive while backgrounded — the spurious 1x reset among them — never
+ * overwrite the tracked value.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
     private var blockedCount = 0
     private val blockedHosts = LinkedHashMap<String, Int>()
 
+    private var videoId: String = ""
+
+    /** True between onResume and onPause. Rate reports only count as the
+     *  user's choice while this is true. */
+    @Volatile private var resumed = false
+    private var hasResumedOnce = false
+
+    /** Last playerState reported by the probe: -1 unstarted, 0 ended,
+     *  1 playing, 2 paused, 3 buffering, 5 cued. */
+    @Volatile private var lastPlayerState = -1
+
+    /** The playback rate the user chose, as last reported by the player
+     *  while this activity was in the foreground. Null until the player
+     *  reports any rate. */
+    @Volatile private var userRate: Double? = null
+
+    /** CI hook (ci_set_rate intent extra): rate to apply once playback
+     *  starts, so the launch test can drive the rate fix scenario. */
+    private var pendingCiRate: Double? = null
+
+    private val pipToggleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_PIP_TOGGLE) togglePlayPause()
+        }
+    }
+    private var pipReceiverRegistered = false
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val videoId = intent.getStringExtra("video_id") ?: ""
+        videoId = intent.getStringExtra("video_id") ?: ""
         intent.getStringExtra("title")?.takeIf { it.isNotBlank() }?.let { title = it }
+        pendingCiRate = intent.getStringExtra("ci_set_rate")?.toDoubleOrNull()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val wv = WebView(this).apply {
@@ -67,6 +119,16 @@ class PlayerActivity : AppCompatActivity() {
         }
         webView = wv
         setContentView(wv)
+
+        val filter = IntentFilter(ACTION_PIP_TOGGLE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(pipToggleReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(pipToggleReceiver, filter)
+        }
+        pipReceiverRegistered = true
+        setPictureInPictureParams(buildPipParams())
+
         if (videoId.isNotBlank()) {
             val embedUrl = "https://www.youtube.com/embed/$videoId" +
                 "?autoplay=1&playsinline=1&rel=0&enablejsapi=1&origin=$BASE_URL"
@@ -84,10 +146,10 @@ class PlayerActivity : AppCompatActivity() {
      * Minimal black full-viewport page holding only the embed iframe, plus
      * a listener for the player's postMessage events (enabled by
      * enablejsapi=1): every event the iframe posts is forwarded to the
-     * YtProbe bridge so the player state — ready, playing, or an error
-     * code — is observable in logcat. The wrapper is cross-origin to the
-     * iframe, so DOM inspection of the player is impossible by design;
-     * these events are the probe channel.
+     * YtProbe bridge so the player state — ready, playing, rate changes,
+     * or an error code — is observable in logcat. The wrapper is
+     * cross-origin to the iframe, so DOM inspection of the player is
+     * impossible by design; these events are the probe channel.
      */
     private fun wrapperHtml(embedUrl: String): String = """
         <!DOCTYPE html>
@@ -127,26 +189,183 @@ class PlayerActivity : AppCompatActivity() {
         </html>
     """.trimIndent()
 
-    /** Receives the wrapper's player-event log lines. Log-only. */
+    /**
+     * The one command path to the player: a postMessage command to the
+     * embed iframe (playVideo / pauseVideo / setPlaybackRate …). Used by
+     * the PiP play/pause action, the rate re-apply, and the CI rate hook,
+     * so there is exactly one place that knows the wire format.
+     */
+    private fun sendPlayerCommand(func: String, args: String = "") {
+        val wv = webView ?: return
+        val js = "(function(){var f=document.getElementById('player');" +
+            "if(f&&f.contentWindow){f.contentWindow.postMessage(JSON.stringify(" +
+            "{event:'command',func:'$func',args:[$args]}),'https://www.youtube.com');}})()"
+        runOnUiThread { wv.evaluateJavascript(js, null) }
+    }
+
+    private fun isPlaying(): Boolean = lastPlayerState == 1 || lastPlayerState == 3
+
+    private fun togglePlayPause() {
+        if (isPlaying()) sendPlayerCommand("pauseVideo") else sendPlayerCommand("playVideo")
+    }
+
+    /** Re-apply the user's chosen rate if the player may have reset it
+     *  while we were away. Idempotent: sending the current rate again is
+     *  a no-op for the player. */
+    private fun maybeReapplyRate(reason: String) {
+        val rate = userRate ?: return
+        if (rate == 1.0) return
+        sendPlayerCommand("setPlaybackRate", rate.toString())
+        Log.d(PROBE_TAG, "reapply playbackRate $rate ($reason)")
+    }
+
+    /** A playback rate reported by the player. Only foreground reports
+     *  are the user's choice; background reports (above all the spurious
+     *  reset to 1x) must not clobber [userRate]. */
+    private fun onRateObserved(rate: Double) {
+        if (!resumed) return
+        if (userRate != rate) {
+            userRate = rate
+            Log.d(PROBE_TAG, "userRate=$rate (foreground)")
+        }
+    }
+
+    private fun onPlayerStateObserved(state: Int) {
+        val wasPlaying = isPlaying()
+        lastPlayerState = state
+        if (state == 1 && pendingCiRate != null) {
+            val rate = pendingCiRate
+            pendingCiRate = null
+            Log.d(PROBE_TAG, "ci hook: setPlaybackRate $rate")
+            sendPlayerCommand("setPlaybackRate", rate.toString())
+        }
+        if (isPlaying() != wasPlaying) {
+            runOnUiThread { setPictureInPictureParams(buildPipParams()) }
+        }
+    }
+
+    /** Receives the wrapper's player-event log lines, and picks the two
+     *  facts the app itself needs — playback rate and player state — out
+     *  of the event stream. */
     private inner class ProbeBridge {
         @JavascriptInterface
         fun log(message: String) {
             Log.d(PROBE_TAG, message.take(500))
+            parseProbeEvent(message)
+        }
+    }
+
+    private fun parseProbeEvent(message: String) {
+        val start = message.indexOf('{')
+        if (start < 0) return
+        try {
+            val json = JSONObject(message.substring(start))
+            val info = json.optJSONObject("info")
+            if (info != null) {
+                if (info.has("playbackRate")) {
+                    onRateObserved(info.optDouble("playbackRate", 1.0))
+                }
+                if (info.has("playerState")) {
+                    onPlayerStateObserved(info.optInt("playerState", -1))
+                }
+            } else if (json.optString("event") == "onPlaybackRateChange") {
+                // The same fact in its other wire form: info is the rate.
+                val rate = json.optDouble("info", Double.NaN)
+                if (!rate.isNaN()) onRateObserved(rate)
+            }
+        } catch (e: Exception) {
+            // Probe parsing is best-effort; the raw line is already logged.
+        }
+    }
+
+    // ---- Picture-in-Picture ----
+
+    private fun buildPipParams(): PictureInPictureParams {
+        val playing = isPlaying()
+        val action = RemoteAction(
+            Icon.createWithResource(
+                this,
+                if (playing) android.R.drawable.ic_media_pause
+                else android.R.drawable.ic_media_play,
+            ),
+            if (playing) "一時停止" else "再生",
+            if (playing) "一時停止" else "再生",
+            android.app.PendingIntent.getBroadcast(
+                this,
+                PIP_REQUEST_CODE,
+                Intent(ACTION_PIP_TOGGLE).setPackage(packageName),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                    android.app.PendingIntent.FLAG_IMMUTABLE,
+            ),
+        )
+        return PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(16, 9))
+            .setActions(listOf(action))
+            .build()
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        // Fires when the user leaves for another app (Home, recents) but
+        // NOT for Back, which finishes the activity directly — that
+        // distinction is exactly the PiP entry condition.
+        Log.d(
+            PROBE_TAG,
+            "userLeaveHint: video=${videoId.isNotBlank()} state=$lastPlayerState playing=${isPlaying()}",
+        )
+        if (videoId.isBlank() || !isPlaying()) return
+        val entered = try {
+            enterPictureInPictureMode(buildPipParams())
+        } catch (e: Exception) {
+            Log.d(PROBE_TAG, "pip enter threw: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        }
+        Log.d(PROBE_TAG, "pip enter requested -> $entered")
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        Log.d(PROBE_TAG, "pip mode changed: $isInPictureInPictureMode")
+        if (!isInPictureInPictureMode) {
+            // Back to full screen: the rate may have been reset in PiP.
+            maybeReapplyRate("pip-exit")
         }
     }
 
     override fun onPause() {
-        webView?.onPause()
+        resumed = false
+        // In PiP the activity is paused but must keep playing: pausing
+        // the WebView would freeze the small window's playback.
+        if (!isInPictureInPictureMode) {
+            webView?.onPause()
+        }
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         webView?.onResume()
+        if (hasResumedOnce) {
+            maybeReapplyRate("resume")
+        } else {
+            hasResumedOnce = true
+        }
     }
 
     override fun onDestroy() {
         Log.d(TAG, "session total: blocked=$blockedCount hosts=$blockedHosts")
+        if (pipReceiverRegistered) {
+            try {
+                unregisterReceiver(pipToggleReceiver)
+            } catch (e: Exception) {
+                // Already unregistered; teardown continues regardless.
+            }
+            pipReceiverRegistered = false
+        }
         webView?.apply {
             stopLoading()
             destroy()
@@ -178,6 +397,8 @@ class PlayerActivity : AppCompatActivity() {
     private companion object {
         const val TAG = "YtAdBlock"
         const val PROBE_TAG = "YtPlayerProbe"
+        const val ACTION_PIP_TOGGLE = "app.ytclient.action.PIP_TOGGLE"
+        const val PIP_REQUEST_CODE = 1
 
         /**
          * Origin the wrapper page is served from, hence the Referer the

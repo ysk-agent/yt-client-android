@@ -60,6 +60,11 @@ jobs:
             logcat.txt
             player-probe.txt
             player-window-dump.xml
+            probe-rate-setup.txt
+            probe-pip.txt
+            probe-return.txt
+            pip-dumpsys.txt
+            screenshot-pip.png
             window_dump.xml
             screenshot-main.png
             screenshot-search.png
