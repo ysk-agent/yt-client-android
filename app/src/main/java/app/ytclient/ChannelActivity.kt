@@ -55,17 +55,6 @@ class ChannelActivity : AppCompatActivity() {
         watchdogHandler.removeCallbacks(watchdog)
     }
 
-    /** The channel header (name / info / description / 動画 heading) as
-     * a single-item adapter, so it scrolls with the list inside the
-     * RecyclerView instead of living in a separate ScrollView. */
-    private inner class HeaderAdapter(private val view: View) :
-        RecyclerView.Adapter<HeaderAdapter.H>() {
-        class H(v: View) : RecyclerView.ViewHolder(v)
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): H = H(view)
-        override fun onBindViewHolder(holder: H, position: Int) {}
-        override fun getItemCount(): Int = 1
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         channelId = intent.getStringExtra("channel_id") ?: ""
@@ -244,4 +233,16 @@ class ChannelActivity : AppCompatActivity() {
     private companion object {
         const val TAG = "YtChannel"
     }
+}
+
+/** The channel header (name / info / description / 動画 heading) as a
+ * single-item adapter, so it scrolls with the list inside the
+ * RecyclerView instead of living in a separate ScrollView. Top-level
+ * because Kotlin prohibits a nested class inside an inner class. */
+private class HeaderAdapter(private val view: View) :
+    RecyclerView.Adapter<HeaderAdapter.H>() {
+    class H(v: View) : RecyclerView.ViewHolder(v)
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): H = H(view)
+    override fun onBindViewHolder(holder: H, position: Int) {}
+    override fun getItemCount(): Int = 1
 }
