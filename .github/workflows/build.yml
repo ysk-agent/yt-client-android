@@ -20,13 +20,16 @@ jobs:
       # The committing agent picks the emulator test scope per change
       # with a [test: all|player|feed|none] marker in the commit
       # message; no marker means all. A manual dispatch can override.
+      # If a message mentions several markers (e.g. quoting the syntax
+      # while describing the policy), the LAST one wins — the operative
+      # marker belongs at the end of the message.
       - name: Determine test scope
         id: scope
         run: |
           SCOPE="${{ inputs.test_scope }}"
           if [ -z "$SCOPE" ] || [ "$SCOPE" = "marker" ]; then
             MSG=$(git log -1 --format=%B)
-            M=$(echo "$MSG" | grep -oE '\[test: (all|player|feed|none)\]' | head -1 | sed 's/\[test: //; s/\]//')
+            M=$(echo "$MSG" | grep -oE '\[test: (all|player|feed|none)\]' | tail -1 | sed 's/\[test: //; s/\]//')
             SCOPE="${M:-all}"
           fi
           echo "test scope: $SCOPE"
