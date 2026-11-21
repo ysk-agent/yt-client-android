@@ -14,12 +14,19 @@ Design (measured 2026-11-16 on the Muse VM):
   published timestamps, exact view counts and the video description —
   metadata the browse grid only carries in compact/relative form or
   not at all.
-- Transport quirk of this egress (measured 2026-11-16): on a single
-  HTTP/2 connection, parallel requests are served strictly one at a
-  time (~0.12-0.14 s apart, a clean staircase), while HTTP/1.1 over a
-  pool of persistent connections genuinely overlaps. The feed route
-  therefore uses its own HTTP/1.1 client with a wide pool; the browse
-  route (sequential requests) keeps HTTP/2.
+- Transport quirk of the Muse VM egress (measured 2026-11-16): on a
+  single HTTP/2 connection, parallel requests are served strictly one
+  at a time (~0.12-0.14 s apart, a clean staircase), while HTTP/1.1
+  over a pool of persistent connections genuinely overlaps. That
+  serialisation is a property of the VM's egress gateway, NOT of
+  YouTube or of direct connections: re-measured 2026-11-21 on the Mac
+  (direct residential egress), HTTP/2 multiplexing fetched the
+  156-channel 経済 group in 0.20 s warm / 0.30 s cold against
+  0.68-0.77 s for the HTTP/1.1 pool, and raising HTTP/1.1 concurrency
+  beyond 32 made it slower (1.3-2.3 s). The feed route therefore uses
+  HTTP/2 by default (one connection, all streams in parallel — also
+  the right shape for the Android app, which connects directly);
+  pass feed_http2=False when running behind the VM egress.
 - The channel grid renders in the lockup format (richItemRenderer >
   lockupViewModel; Shorts use shortsLockupViewModel). View counts are
   compact text ("145K") and publish times relative ("2w ago") there;
@@ -415,10 +422,17 @@ def _proxy_from_env() -> str | None:
 class YoutubeChannelClient:
     """Async channel client. One instance = one warm HTTP/2 connection."""
 
-    def __init__(self, hl: str = "en", gl: str = "US", state_file: Path = STATE_FILE):
+    def __init__(
+        self,
+        hl: str = "en",
+        gl: str = "US",
+        state_file: Path = STATE_FILE,
+        feed_http2: bool = True,
+    ):
         self.hl = hl
         self.gl = gl
         self.state_file = state_file
+        self.feed_http2 = feed_http2
         self._api_key: str | None = None
         self._client_version: str | None = None
         self._client: httpx.AsyncClient | None = None
@@ -444,9 +458,14 @@ class YoutubeChannelClient:
 
     async def __aenter__(self) -> "YoutubeChannelClient":
         self._client = self._make_client(http2=True, max_connections=8)
-        # Feeds: HTTP/1.1 + wide pool — parallel requests on one HTTP/2
-        # connection are serialised by this egress (see module docstring).
-        self._feed_client = self._make_client(http2=False, max_connections=40)
+        # Feeds: HTTP/2 multiplexed over a small pool by default — one
+        # TLS handshake and every stream in parallel (see module
+        # docstring). feed_http2=False falls back to the old HTTP/1.1
+        # wide pool for the VM-egress route, which serialises HTTP/2.
+        if self.feed_http2:
+            self._feed_client = self._make_client(http2=True, max_connections=8)
+        else:
+            self._feed_client = self._make_client(http2=False, max_connections=40)
         return self
 
     async def __aexit__(self, *exc) -> None:
