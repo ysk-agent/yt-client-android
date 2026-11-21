@@ -236,7 +236,13 @@ class PlayerActivity : AppCompatActivity() {
         // of finishing the player (v0.1.15). The activity is resumed and
         // in the foreground here, so the manual enter call does not race
         // a transition the way the Home path did. Back while paused or
-        // ended keeps the plain finish.
+        // ended keeps the plain finish — with one exception (v0.1.17):
+        // when this activity is the root of its task there is nothing
+        // beneath it to go back to. That happens when a player task is
+        // restored on its own after the app was closed (the PiP
+        // transition had split the player into its own task), and
+        // finishing there exits the app with no way back to the feed.
+        // Route to the feed explicitly instead.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (videoId.isNotBlank() && isPlaying()) {
@@ -248,6 +254,15 @@ class PlayerActivity : AppCompatActivity() {
                     }
                     Log.d(PROBE_TAG, "back -> pip: $entered")
                     if (entered) return
+                }
+                if (isTaskRoot) {
+                    Log.d(PROBE_TAG, "back at task root: routing to feed")
+                    startActivity(Intent(this@PlayerActivity, MainActivity::class.java).apply {
+                        addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+                    })
                 }
                 finish()
             }

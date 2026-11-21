@@ -57,9 +57,19 @@ def _err(e: Exception) -> str:
     )
 
 
+# No bridge call may occupy the (single) bridge thread forever: a
+# connection whose peer trickles bytes slower than the per-read
+# timeout never trips httpx's timeouts, so the whole coroutine gets a
+# total budget as well. 90 s is far above every legitimate call (the
+# 156-channel home feed completes in seconds); a timeout surfaces as
+# an error the UI can show and retry from, instead of an eternal
+# spinner that also blocks every later bridge call behind it.
+_RUN_TIMEOUT_SECONDS = 90
+
+
 def _run(coro_fn) -> str:
     try:
-        return _ok(asyncio.run(coro_fn()))
+        return _ok(asyncio.run(asyncio.wait_for(coro_fn(), _RUN_TIMEOUT_SECONDS)))
     except Exception as e:  # noqa: BLE001 - mapped to JSON for Kotlin
         return _err(e)
 

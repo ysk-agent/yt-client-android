@@ -31,10 +31,18 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
         <activity android:name=".DetailActivity" android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
+        <!-- excludeFromRecents + autoRemoveFromRecents: entering PiP
+             splits the player into its own task; without these, that
+             task lingers in recents on its own and relaunching the app
+             can land on a lone player with no feed beneath it. They
+             only affect tasks rooted at the player — the main task is
+             rooted at MainActivity and is unaffected. -->
         <activity
             android:name=".PlayerActivity"
             android:exported="false"
             android:supportsPictureInPicture="true"
+            android:excludeFromRecents="true"
+            android:autoRemoveFromRecents="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
         <activity android:name=".ChannelActivity" android:exported="false"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />

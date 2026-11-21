@@ -1,6 +1,9 @@
 package app.ytclient
 
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -23,6 +26,33 @@ class ChannelActivity : AppCompatActivity() {
     private var feedPhase = true
     private var channelId: String = ""
     private var channelName: String = ""
+
+    /** Stage label of the in-flight paging call ("browse初回" /
+     * "継続ページ"), used by the watchdog below. */
+    private var pagingStage: String? = null
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+    private val watchdog = Runnable {
+        val stage = pagingStage ?: return@Runnable
+        // The call is still out after 30 s: say where it is stuck
+        // instead of leaving an unexplained spinner. The call itself
+        // is bounded by the bridge's total timeout and will still
+        // resolve or error out on its own.
+        Log.w(TAG, "paging watchdog: stuck at stage=$stage channel=$channelId")
+        status.text = "読み込みが長引いています（段階: $stage）…"
+    }
+
+    private fun pagingStart(stage: String) {
+        pagingStage = stage
+        Log.d(TAG, "paging start: stage=$stage channel=$channelId")
+        watchdogHandler.removeCallbacks(watchdog)
+        watchdogHandler.postDelayed(watchdog, 30_000)
+    }
+
+    private fun pagingEnd(stage: String, result: String) {
+        Log.d(TAG, "paging end: stage=$stage result=$result channel=$channelId")
+        pagingStage = null
+        watchdogHandler.removeCallbacks(watchdog)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,16 +157,19 @@ class ChannelActivity : AppCompatActivity() {
     private fun bootstrapBrowse() {
         if (loading) return
         loading = true
+        pagingStart("browse初回")
         status.text = "続きを読み込み中…"
         Bridge.call("channel_videos", channelId, "latest") { data, err ->
             loading = false
             if (err != null || data == null) {
+                pagingEnd("browse初回", "error: $err")
                 status.text = "ページングエラー: $err"
                 return@call
             }
             feedPhase = false
             val items = Video.list(data.optJSONArray("items")).filter { it.kind == "video" }
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
+            pagingEnd("browse初回", "items=${items.size} continuation=${continuation != null}")
             adapter.set(items)
             status.text = "全 ${adapter.itemCount} 件"
             scroll.post { maybeLoadMore() }
@@ -146,18 +179,33 @@ class ChannelActivity : AppCompatActivity() {
     private fun loadNext() {
         val cont = continuation ?: return
         loading = true
+        pagingStart("継続ページ")
         status.text = "続きを読み込み中…"
         Bridge.call("channel_videos_next", cont, channelId, channelName) { data, err ->
             loading = false
             if (err != null || data == null) {
+                pagingEnd("継続ページ", "error: $err")
                 status.text = "ページングエラー: $err"
                 return@call
             }
             val items = Video.list(data.optJSONArray("items")).filter { it.kind == "video" }
             continuation = if (data.isNull("continuation")) null else data.optString("continuation")
+            pagingEnd("継続ページ", "items=${items.size} continuation=${continuation != null}")
+            if (items.isEmpty()) {
+                // An empty page means there is nothing more to page
+                // through, whatever the token says: stop here instead
+                // of re-firing loadNext at the same scroll position.
+                continuation = null
+                status.text = "全 ${adapter.itemCount} 件（これ以上ありません）"
+                return@call
+            }
             adapter.add(items)
             status.text = "全 ${adapter.itemCount} 件"
             scroll.post { maybeLoadMore() }
         }
+    }
+
+    private companion object {
+        const val TAG = "YtChannel"
     }
 }
