@@ -12,6 +12,8 @@ import android.graphics.Color
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Rational
 import android.view.ViewGroup
@@ -21,6 +23,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -74,6 +77,22 @@ import java.io.ByteArrayInputStream
  * whenever the activity returns to the foreground. Rate reports that
  * arrive while backgrounded — the spurious 1x reset among them — never
  * overwrite the tracked value.
+ *
+ * v0.1.15: four additions.
+ * - Back while playing enters PiP (over the Detail screen beneath)
+ *   instead of finishing; Back while paused still finishes.
+ * - The chosen rate is remembered app-wide (Prefs.playbackRate) and
+ *   applied when a newly opened video starts playing.
+ * - Per-video resume positions: while playing, the position is polled
+ *   every 5 s (getCurrentTime command; the player answers through the
+ *   same infoDelivery probe events that carry state and rate) and
+ *   saved to Prefs; reopening a video seeks back to it once playback
+ *   starts. Ending a video, or reaching its last 10 seconds, clears
+ *   the saved point.
+ * - The WebView gets the status-bar height as top padding (in PiP it
+ *   is dropped again): with targetSdk 35 the activity draws
+ *   edge-to-edge, and without the inset the embed's top controls sat
+ *   underneath the system status bar.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -100,6 +119,34 @@ class PlayerActivity : AppCompatActivity() {
      *  starts, so the launch test can drive the rate fix scenario. */
     private var pendingCiRate: Double? = null
 
+    /** Status-bar height in px, applied as the WebView's top padding
+     * outside PiP so the embed's top controls clear the system bar. */
+    private var statusBarPad = 0
+
+    /** True once this instance has seen its first "playing" state: the
+     * moment the resume seek and the remembered rate are applied. */
+    private var startedOnce = false
+
+    /** Last position / duration (seconds) the player reported through
+     * the probe, and the last position actually persisted. */
+    @Volatile private var lastPosSec = 0.0
+    @Volatile private var lastDurSec = 0.0
+    @Volatile private var lastSavedPosSec = 0.0
+
+    private val posHandler = Handler(Looper.getMainLooper())
+    private val posPoller = object : Runnable {
+        override fun run() {
+            if (lastPlayerState == 1) {
+                // The player answers getter commands with infoDelivery
+                // events on the probe channel (parsed in parseProbeEvent).
+                sendPlayerCommand("getCurrentTime")
+                sendPlayerCommand("getDuration")
+                savePosition("poll")
+            }
+            posHandler.postDelayed(this, 5000)
+        }
+    }
+
     private val pipToggleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == ACTION_PIP_TOGGLE) togglePlayPause()
@@ -115,12 +162,17 @@ class PlayerActivity : AppCompatActivity() {
         pendingCiRate = intent.getStringExtra("ci_set_rate")?.toDoubleOrNull()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        val sbRes = resources.getIdentifier("status_bar_height", "dimen", "android")
+        statusBarPad = if (sbRes > 0) resources.getDimensionPixelSize(sbRes) else 0
         val wv = WebView(this).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             setBackgroundColor(Color.BLACK)
+            // Edge-to-edge (targetSdk 35) would otherwise slide the
+            // embed's top controls under the status bar.
+            setPadding(0, statusBarPad, 0, 0)
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -140,6 +192,27 @@ class PlayerActivity : AppCompatActivity() {
         }
         pipReceiverRegistered = true
         setPictureInPictureParams(buildPipParams())
+
+        // Back while playing: enter PiP over the Detail screen instead
+        // of finishing the player (v0.1.15). The activity is resumed and
+        // in the foreground here, so the manual enter call does not race
+        // a transition the way the Home path did. Back while paused or
+        // ended keeps the plain finish.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (videoId.isNotBlank() && isPlaying()) {
+                    val entered = try {
+                        enterPictureInPictureMode(buildPipParams())
+                    } catch (e: Exception) {
+                        Log.d(PROBE_TAG, "back pip enter threw: ${e.message}")
+                        false
+                    }
+                    Log.d(PROBE_TAG, "back -> pip: $entered")
+                    if (entered) return
+                }
+                finish()
+            }
+        })
 
         if (videoId.isNotBlank()) {
             val embedUrl = "https://www.youtube.com/embed/$videoId" +
@@ -233,24 +306,67 @@ class PlayerActivity : AppCompatActivity() {
 
     /** A playback rate reported by the player. Only foreground reports
      *  are the user's choice; background reports (above all the spurious
-     *  reset to 1x) must not clobber [userRate]. */
+     *  reset to 1x) must not clobber [userRate]. A foreground choice is
+     *  also the app-wide remembered rate for the next video. */
     private fun onRateObserved(rate: Double) {
         if (!resumed) return
         if (userRate != rate) {
             userRate = rate
-            Log.d(PROBE_TAG, "userRate=$rate (foreground)")
+            Prefs.setPlaybackRate(this, rate)
+            Log.d(PROBE_TAG, "userRate=$rate (foreground, remembered)")
         }
+    }
+
+    /** Persists the current resume position for this video. Near the
+     * end of the video the saved point is dropped instead, so a video
+     * watched to (near) completion restarts from the beginning. */
+    private fun savePosition(reason: String) {
+        val t = lastPosSec
+        if (videoId.isBlank() || t <= 0.0) return
+        val dur = lastDurSec
+        if (dur > 0 && t >= dur - 10) {
+            if (Prefs.position(this, videoId) > 0) {
+                Prefs.clearPosition(this, videoId)
+                Log.d(PROBE_TAG, "pos cleared (near end $t/$dur) $videoId")
+            }
+            lastSavedPosSec = t
+            return
+        }
+        if (reason == "poll" && kotlin.math.abs(t - lastSavedPosSec) < 5.0) return
+        Prefs.setPosition(this, videoId, t)
+        lastSavedPosSec = t
+        Log.d(PROBE_TAG, "pos save $videoId t=$t ($reason)")
     }
 
     private fun onPlayerStateObserved(state: Int) {
         val wasPlaying = isPlaying()
         lastPlayerState = state
-        if (state == 1 && pendingCiRate != null) {
-            val rate = pendingCiRate
+        if (state == 1 && !startedOnce) {
+            startedOnce = true
+            // Resume where this video was left (positions under 10 s
+            // are treated as "not really started" and ignored).
+            val saved = Prefs.position(this, videoId)
+            if (saved >= 10.0) {
+                Log.d(PROBE_TAG, "pos restore: seekTo $saved for $videoId")
+                sendPlayerCommand("seekTo", "$saved,true")
+            }
+            // The remembered rate (or the CI hook's rate) applies from
+            // the start of every playback session.
+            val rate = pendingCiRate ?: Prefs.playbackRate(this).takeIf { it != 1.0 }
             pendingCiRate = null
-            Log.d(PROBE_TAG, "ci hook: setPlaybackRate $rate")
-            sendPlayerCommand("setPlaybackRate", rate.toString())
+            if (rate != null) {
+                Log.d(PROBE_TAG, "initial rate apply: $rate")
+                sendPlayerCommand("setPlaybackRate", rate.toString())
+            }
         }
+        if (state == 0) {
+            // Ended: the resume point has served its purpose.
+            Prefs.clearPosition(this, videoId)
+            lastPosSec = 0.0
+            lastSavedPosSec = 0.0
+            Log.d(PROBE_TAG, "pos cleared (ended) $videoId")
+        }
+        if (state == 2) savePosition("paused")
         if (isPlaying() != wasPlaying) {
             runOnUiThread { setPictureInPictureParams(buildPipParams()) }
         }
@@ -276,6 +392,14 @@ class PlayerActivity : AppCompatActivity() {
             if (info != null) {
                 if (info.has("playbackRate")) {
                     onRateObserved(info.optDouble("playbackRate", 1.0))
+                }
+                if (info.has("currentTime")) {
+                    val t = info.optDouble("currentTime", Double.NaN)
+                    if (!t.isNaN() && t >= 0) lastPosSec = t
+                }
+                if (info.has("duration")) {
+                    val d = info.optDouble("duration", Double.NaN)
+                    if (!d.isNaN() && d > 0) lastDurSec = d
                 }
                 if (info.has("playerState")) {
                     onPlayerStateObserved(info.optInt("playerState", -1))
@@ -353,6 +477,8 @@ class PlayerActivity : AppCompatActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         Log.d(PROBE_TAG, "pip mode changed: $isInPictureInPictureMode")
+        // The small window has no status bar to clear: drop the inset.
+        webView?.setPadding(0, if (isInPictureInPictureMode) 0 else statusBarPad, 0, 0)
         if (!isInPictureInPictureMode) {
             // Back to full screen: the rate may have been reset in PiP.
             maybeReapplyRate("pip-exit")
@@ -361,6 +487,8 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onPause() {
         resumed = false
+        posHandler.removeCallbacks(posPoller)
+        savePosition("activity-pause")
         // In PiP the activity is paused but must keep playing: pausing
         // the WebView would freeze the small window's playback.
         if (!isInPictureInPictureMode) {
@@ -373,6 +501,8 @@ class PlayerActivity : AppCompatActivity() {
         super.onResume()
         resumed = true
         webView?.onResume()
+        posHandler.removeCallbacks(posPoller)
+        posHandler.postDelayed(posPoller, 5000)
         if (hasResumedOnce) {
             maybeReapplyRate("resume")
         } else {
@@ -381,6 +511,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        savePosition("destroy")
         Log.d(TAG, "session total: blocked=$blockedCount hosts=$blockedHosts")
         if (pipReceiverRegistered) {
             try {

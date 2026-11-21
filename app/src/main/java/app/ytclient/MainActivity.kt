@@ -22,9 +22,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var feedAdapter: VideoAdapter
     private lateinit var chipRow: LinearLayout
     private lateinit var debugRow: LinearLayout
+    private lateinit var feedRv: RecyclerView
+    private lateinit var feedLm: LinearLayoutManager
     private var groups: List<Pair<String, List<String>>> = emptyList()
     private var currentGroup = ""
     private var currentIds: List<String> = emptyList()
+    /** Group whose items the adapter currently shows ("" = none yet). A
+     * re-select of the same group skips the cache render so the live
+     * scroll position is the only anchor that matters. */
+    private var shownGroup = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -125,8 +131,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(status)
 
         feedAdapter = VideoAdapter(this)
-        val feedRv = RecyclerView(this).apply {
-            layoutManager = LinearLayoutManager(this@MainActivity)
+        feedLm = LinearLayoutManager(this)
+        feedRv = RecyclerView(this).apply {
+            layoutManager = feedLm
             adapter = feedAdapter
             setPadding(dp(12), 0, dp(12), dp(8))
             clipToPadding = false
@@ -134,6 +141,13 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
             )
         }
+        // Persist the scroll anchor whenever scrolling settles, so a
+        // restart (or process death) reopens the feed where it was left.
+        feedRv.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_IDLE) saveAnchor()
+            }
+        })
         root.addView(feedRv)
 
         val ver = try {
@@ -148,8 +162,40 @@ class MainActivity : AppCompatActivity() {
         groups = loadGroups()
         buildChips()
         buildDebugRow()
-        val def = groups.firstOrNull { it.first == "経済" } ?: groups.firstOrNull()
+        val last = Prefs.lastGroup(this)
+        val def = groups.firstOrNull { it.first == last }
+            ?: groups.firstOrNull { it.first == "経済" } ?: groups.firstOrNull()
         if (def != null) selectGroup(def.first, def.second) else status.text = "グループ資産がありません"
+    }
+
+    override fun onPause() {
+        saveAnchor()
+        super.onPause()
+    }
+
+    /** The current scroll anchor: first (partially) visible row's
+     * videoId and its top offset within the list. Null when the list is
+     * empty or not laid out yet. */
+    private fun captureAnchor(): Pair<String, Int>? {
+        val pos = feedLm.findFirstVisibleItemPosition()
+        if (pos == RecyclerView.NO_POSITION) return null
+        val item = feedAdapter.items.getOrNull(pos) ?: return null
+        val view = feedLm.findViewByPosition(pos) ?: return null
+        return item.id to view.top
+    }
+
+    private fun saveAnchor() {
+        if (currentGroup.isEmpty() || shownGroup != currentGroup) return
+        val (id, off) = captureAnchor() ?: return
+        Prefs.setFeedAnchor(this, currentGroup, id, off)
+    }
+
+    /** Scroll so that [anchor]'s row sits where it was, in whatever item
+     * list the adapter currently holds. If the row is gone (aged out of
+     * the feed), the position is left alone. */
+    private fun applyAnchor(anchor: Pair<String, Int>) {
+        val idx = feedAdapter.items.indexOfFirst { it.id == anchor.first }
+        if (idx >= 0) feedLm.scrollToPositionWithOffset(idx, anchor.second)
     }
 
     private fun submitSearch(q: String) {
@@ -221,17 +267,38 @@ class MainActivity : AppCompatActivity() {
     private fun selectGroup(name: String, ids: List<String>) {
         currentGroup = name
         currentIds = ids
+        Prefs.setLastGroup(this, name)
         buildChips()
         updateUpdatedLabel()
-        status.text = "「$name」の新着を取得中…"
+        // Switching to a group that is not on screen: render its
+        // persisted items immediately (with its saved scroll anchor) and
+        // refresh behind them. Re-selecting the visible group keeps the
+        // live list untouched and only refreshes.
+        if (shownGroup != name) {
+            val cached = FeedCache.load(this, name)
+            if (cached != null) {
+                feedAdapter.set(cached)
+                shownGroup = name
+                Prefs.feedAnchor(this, name)?.let { applyAnchor(it) }
+                status.text = "「$name」の保存済みフィードを表示中・更新しています…"
+            } else {
+                status.text = "「$name」の新着を取得中…"
+            }
+        } else {
+            status.text = "「$name」の新着を取得中…"
+        }
         Bridge.call("feeds", JSONArray(ids).toString()) { data, err ->
+            // A late reply for a group the user has since left must not
+            // clobber the screen (its cache write below is still useful).
             if (err != null || data == null) {
-                status.text = "フィード取得エラー: $err"
+                if (currentGroup == name) status.text = "フィード取得エラー: $err"
                 return@call
             }
             // Defence in depth: the bridge already excludes Shorts from
             // feeds, but drop any flagged item here too.
             val items = Video.list(data.optJSONArray("items")).filter { !it.isShorts }
+            FeedCache.save(this, name, data.optJSONArray("items"))
+            if (currentGroup != name) return@call
             val errs = data.optJSONObject("errors")
             Prefs.setFeedUpdatedAt(this, name, System.currentTimeMillis())
             updateUpdatedLabel()
@@ -240,7 +307,14 @@ class MainActivity : AppCompatActivity() {
                 errs != null && errs.length() > 0 -> "${items.size} 件 · ${errs.length()} チャンネル取得失敗"
                 else -> "${items.size} 件の新着"
             }
+            // Keep the user's place across the replacement: anchor on
+            // the row at the top of the screen right now and re-find it
+            // in the fresh list, so newly arrived items above it do not
+            // shift what is being read.
+            val anchor = captureAnchor()
             feedAdapter.set(items)
+            shownGroup = name
+            if (anchor != null) applyAnchor(anchor)
         }
     }
 }

@@ -249,6 +249,76 @@ object Prefs {
         ctx.getSharedPreferences(FILE, 0).edit().putLong("feed_updated_$group", at).apply()
     }
 
+    /** Last group shown on the home feed, so a restart reopens where the
+     * user left off instead of always resetting to the default group. */
+    fun lastGroup(ctx: android.content.Context): String? =
+        ctx.getSharedPreferences(FILE, 0).getString("last_group", null)
+    fun setLastGroup(ctx: android.content.Context, group: String) {
+        ctx.getSharedPreferences(FILE, 0).edit().putString("last_group", group).apply()
+    }
+
+    /**
+     * Scroll anchor of a group's feed: the videoId of the first visible
+     * row plus its pixel offset from the list top. Restoring by videoId
+     * (not by index) keeps the user's place even when a refresh inserts
+     * newer items above it. Stored as "<videoId>|<offsetPx>".
+     */
+    fun feedAnchor(ctx: android.content.Context, group: String): Pair<String, Int>? {
+        val raw = ctx.getSharedPreferences(FILE, 0).getString("feed_anchor_$group", null)
+            ?: return null
+        val sep = raw.lastIndexOf('|')
+        if (sep <= 0) return null
+        val off = raw.substring(sep + 1).toIntOrNull() ?: return null
+        return raw.substring(0, sep) to off
+    }
+    fun setFeedAnchor(ctx: android.content.Context, group: String, videoId: String, offsetPx: Int) {
+        ctx.getSharedPreferences(FILE, 0).edit()
+            .putString("feed_anchor_$group", "$videoId|$offsetPx").apply()
+    }
+
+    /** The playback rate the user last chose in the player, remembered
+     * app-wide: a newly opened video starts at this rate. */
+    fun playbackRate(ctx: android.content.Context): Double =
+        ctx.getSharedPreferences(FILE, 0).getFloat("playback_rate", 1.0f).toDouble()
+    fun setPlaybackRate(ctx: android.content.Context, rate: Double) {
+        ctx.getSharedPreferences(FILE, 0).edit().putFloat("playback_rate", rate.toFloat()).apply()
+    }
+
+    /**
+     * Per-video resume positions, seconds, as one JSON object
+     * {videoId: seconds}. Written by the player while a video plays and
+     * read back when the same video is opened again; an entry is dropped
+     * when the video ends or plays into its last seconds, so a finished
+     * video starts from the beginning next time. Capped at 300 entries
+     * (arbitrary eviction beyond that — the map is a convenience cache,
+     * not a record).
+     */
+    private fun positionsJson(ctx: android.content.Context): JSONObject {
+        val raw = ctx.getSharedPreferences(FILE, 0).getString("positions_v1", null)
+        return try { if (raw != null) JSONObject(raw) else JSONObject() } catch (e: Exception) { JSONObject() }
+    }
+    fun position(ctx: android.content.Context, videoId: String): Double {
+        if (videoId.isBlank()) return 0.0
+        return positionsJson(ctx).optDouble(videoId, 0.0)
+    }
+    fun setPosition(ctx: android.content.Context, videoId: String, seconds: Double) {
+        if (videoId.isBlank() || seconds <= 0.0) return
+        val map = positionsJson(ctx)
+        map.put(videoId, seconds)
+        if (map.length() > 300) {
+            val keys = map.keys()
+            while (map.length() > 300 && keys.hasNext()) map.remove(keys.next())
+        }
+        ctx.getSharedPreferences(FILE, 0).edit().putString("positions_v1", map.toString()).apply()
+    }
+    fun clearPosition(ctx: android.content.Context, videoId: String) {
+        if (videoId.isBlank()) return
+        val map = positionsJson(ctx)
+        if (!map.has(videoId)) return
+        map.remove(videoId)
+        ctx.getSharedPreferences(FILE, 0).edit().putString("positions_v1", map.toString()).apply()
+    }
+
     /**
      * Gemini formatting prompts for the Detail screen, kept per caption
      * language: what needs fixing differs by source language (Japanese
@@ -304,6 +374,51 @@ object Prefs {
             .remove("format_prompt_$lang")
         if (lang.startsWith("ja")) edit.remove("format_prompt")
         edit.apply()
+    }
+}
+
+/**
+ * Persisted home-feed items, one file per group under filesDir, holding
+ * the bridge's raw items array wrapped as {"group": name, "items": […]}.
+ * The home screen renders this instantly on open (a restart or a group
+ * switch never starts from an empty list) and then refreshes from the
+ * network in the background; the scroll anchor (Prefs.feedAnchor) is
+ * what keeps the user's place across that replacement. Writes run on a
+ * background executor; reads are small enough for the caller's thread in
+ * practice (worst case ~2,300 feed rows ≈ 1 MB of JSON).
+ */
+object FeedCache {
+    private val exec = Executors.newSingleThreadExecutor()
+
+    private fun file(ctx: android.content.Context, group: String): java.io.File {
+        val safe = group.map { c -> if (c.isLetterOrDigit()) c else '_' }.joinToString("")
+        return java.io.File(ctx.filesDir, "feedcache_$safe.json")
+    }
+
+    fun load(ctx: android.content.Context, group: String): List<Video>? {
+        return try {
+            val f = file(ctx, group)
+            if (!f.exists()) return null
+            val root = JSONObject(f.readText())
+            if (root.optString("group") != group) return null
+            val items = Video.list(root.optJSONArray("items")).filter { !it.isShorts }
+            items.ifEmpty { null }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun save(ctx: android.content.Context, group: String, items: JSONArray?) {
+        if (items == null) return
+        val text = JSONObject().put("group", group).put("items", items).toString()
+        val f = file(ctx, group)
+        exec.execute {
+            try {
+                val tmp = java.io.File(f.parentFile, f.name + ".tmp")
+                tmp.writeText(text)
+                if (!tmp.renameTo(f)) tmp.delete()
+            } catch (e: Exception) { /* cache is best-effort */ }
+        }
     }
 }
 
