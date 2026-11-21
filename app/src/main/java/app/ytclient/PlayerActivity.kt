@@ -152,6 +152,17 @@ import java.io.ByteArrayInputStream
  * re-arm the remembered rate as the rate target (armRateTarget), so
  * the player's own reports drive the confirmation loop until it
  * verifiably plays at the target.
+ *
+ * v0.1.23: lock-screen audio, second attempt — the first (v0.1.20,
+ * not pausing the WebView) was necessary but not sufficient. An
+ * on-device log (2026-11-22) shows why: ~5 s after PiP entry, at the
+ * lock moment, the embed reported playerState 2 (paused) on its own
+ * — the page being hidden pauses the player — while the process
+ * stayed alive and the rate held at 1.5. So a paused report in a
+ * background context (PiP, or screen off / keyguard) while playback
+ * is desired (desiredPlaying) is now answered with playVideo, up to
+ * 3 attempts per episode; an on-screen pause remains the user's and
+ * clears the desire, as does the PiP toggle.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -197,6 +208,19 @@ class PlayerActivity : AppCompatActivity() {
     /** True once this instance has seen its first "playing" state: the
      * moment the resume seek and the remembered rate are applied. */
     private var startedOnce = false
+
+    /** Whether playback is supposed to be running, as far as the user
+     *  has expressed it: set by playing states and by the PiP toggle,
+     *  cleared by an on-screen pause or by the video ending. The embed
+     *  pauses ITSELF when the page is hidden (lock screen tearing down
+     *  the PiP window) even though nobody asked it to — on-device log,
+     *  2026-11-22: playerState 2 arrived ~5 s after PiP entry, at the
+     *  lock moment, with the process fully alive. A paused report in a
+     *  background context (PiP or screen off/locked) while this is true
+     *  is therefore the player's own doing and is answered with a
+     *  bounded auto-resume (v0.1.23). */
+    @Volatile private var desiredPlaying = false
+    @Volatile private var autoResumeAttempts = 0
 
     /** Last position / duration (seconds) the player reported through
      * the probe, and the last position actually persisted. */
@@ -390,7 +414,13 @@ class PlayerActivity : AppCompatActivity() {
     private fun isPlaying(): Boolean = lastPlayerState == 1 || lastPlayerState == 3
 
     private fun togglePlayPause() {
-        if (isPlaying()) sendPlayerCommand("pauseVideo") else sendPlayerCommand("playVideo")
+        if (isPlaying()) {
+            desiredPlaying = false
+            sendPlayerCommand("pauseVideo")
+        } else {
+            desiredPlaying = true
+            sendPlayerCommand("playVideo")
+        }
     }
 
     /** PiP speed action: cycle to the next rate step and make it the
@@ -547,6 +577,10 @@ class PlayerActivity : AppCompatActivity() {
     private fun onPlayerStateObserved(state: Int) {
         val wasPlaying = isPlaying()
         lastPlayerState = state
+        if (state == 1) {
+            desiredPlaying = true
+            autoResumeAttempts = 0
+        }
         if (state == 1 && !startedOnce) {
             startedOnce = true
             // Resume where this video was left (positions under 10 s
@@ -567,12 +601,35 @@ class PlayerActivity : AppCompatActivity() {
         }
         if (state == 0) {
             // Ended: the resume point has served its purpose.
+            desiredPlaying = false
             Prefs.clearPosition(this, videoId)
             lastPosSec = 0.0
             lastSavedPosSec = 0.0
             Log.d(PROBE_TAG, "pos cleared (ended) $videoId")
         }
-        if (state == 2) savePosition("paused")
+        if (state == 2) {
+            savePosition("paused")
+            // The embed pauses itself when its page is hidden — the
+            // lock screen tearing down the PiP window is the observed
+            // case (v0.1.23). A pause reported in a background context
+            // while playback is desired is not the user's: answer it
+            // with playVideo, bounded per episode (the counter resets
+            // on the next playing state). A pause with the player on
+            // screen IS the user's, and clears the desire.
+            val inPip = isInPictureInPictureMode
+            val locked = screenOffOrLocked()
+            if (!inPip && !locked) {
+                desiredPlaying = false
+            } else if (desiredPlaying && autoResumeAttempts < 3) {
+                autoResumeAttempts++
+                Log.d(
+                    PROBE_TAG,
+                    "auto-resume: player paused itself in background " +
+                        "(pip=$inPip locked=$locked), playVideo attempt $autoResumeAttempts",
+                )
+                sendPlayerCommand("playVideo")
+            }
+        }
         if (isPlaying() != wasPlaying) {
             runOnUiThread { setPictureInPictureParams(buildPipParams()) }
         }
