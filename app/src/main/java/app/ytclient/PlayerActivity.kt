@@ -1,6 +1,7 @@
 package app.ytclient
 
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
 import android.app.PictureInPictureParams
 import android.app.RemoteAction
 import android.content.BroadcastReceiver
@@ -14,6 +15,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import android.util.Rational
 import android.view.ViewGroup
@@ -113,6 +115,21 @@ import java.io.ByteArrayInputStream
  * - Duration actually arrives inside info.progressState, not as a
  *   top-level info field; the parser reads it from there (the
  *   near-end resume-point clearing depends on it).
+ *
+ * v0.1.20: two playback-environment additions.
+ * - A speed action inside PiP. The gear in the PiP window is a system
+ *   button whose destination (the OS PiP-permission settings) the app
+ *   cannot change, so speed control arrives as a custom RemoteAction
+ *   with a gear icon instead: each tap cycles to the next rate in
+ *   PIP_RATE_STEPS, the action's title shows the current rate, and the
+ *   choice goes through the same remembered-rate path as a foreground
+ *   choice (userRate + Prefs), so it survives leaving PiP and opening
+ *   the next video.
+ * - Audio continues on the lock screen. onPause normally pauses the
+ *   WebView, which stops playback when the user locks the device; when
+ *   the screen is off or the keyguard is locked, the WebView is left
+ *   running exactly as it is in PiP, so playback continues as audio
+ *   regardless of whether PiP was active.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -181,7 +198,10 @@ class PlayerActivity : AppCompatActivity() {
 
     private val pipToggleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == ACTION_PIP_TOGGLE) togglePlayPause()
+            when (intent.action) {
+                ACTION_PIP_TOGGLE -> togglePlayPause()
+                ACTION_PIP_SPEED -> cyclePlaybackRate()
+            }
         }
     }
     private var pipReceiverRegistered = false
@@ -223,7 +243,10 @@ class PlayerActivity : AppCompatActivity() {
         ).apply { topMargin = statusBarPad })
         setContentView(container)
 
-        val filter = IntentFilter(ACTION_PIP_TOGGLE)
+        val filter = IntentFilter().apply {
+            addAction(ACTION_PIP_TOGGLE)
+            addAction(ACTION_PIP_SPEED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(pipToggleReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -347,6 +370,28 @@ class PlayerActivity : AppCompatActivity() {
     private fun togglePlayPause() {
         if (isPlaying()) sendPlayerCommand("pauseVideo") else sendPlayerCommand("playVideo")
     }
+
+    /** PiP speed action: cycle to the next rate step and make it the
+     *  remembered rate, exactly as if the user had picked it in the
+     *  foreground. The pending rate target (if any) is dropped: this
+     *  tap is the newest choice, and the foreground re-apply on PiP
+     *  exit works from userRate. The PiP params are refreshed so the
+     *  action's title shows the new rate. */
+    private fun cyclePlaybackRate() {
+        val current = userRate ?: 1.0
+        val next = PIP_RATE_STEPS.firstOrNull { it > current + 0.001 }
+            ?: PIP_RATE_STEPS.first()
+        userRate = next
+        rateTarget = null
+        Prefs.setPlaybackRate(this, next)
+        sendPlayerCommand("setPlaybackRate", next.toString())
+        Log.d(PROBE_TAG, "pip speed -> $next (was $current)")
+        runOnUiThread { setPictureInPictureParams(buildPipParams()) }
+    }
+
+    private fun formatRate(rate: Double): String =
+        if (rate == rate.toLong().toDouble()) rate.toLong().toString()
+        else rate.toString()
 
     /** Re-apply the user's chosen rate if the player may have reset it
      *  while we were away. Idempotent: sending the current rate again is
@@ -540,9 +585,22 @@ class PlayerActivity : AppCompatActivity() {
                     android.app.PendingIntent.FLAG_IMMUTABLE,
             ),
         )
+        val speedLabel = "速度 ${formatRate(userRate ?: 1.0)}x"
+        val speedAction = RemoteAction(
+            Icon.createWithResource(this, android.R.drawable.ic_menu_preferences),
+            speedLabel,
+            speedLabel,
+            android.app.PendingIntent.getBroadcast(
+                this,
+                PIP_SPEED_REQUEST_CODE,
+                Intent(ACTION_PIP_SPEED).setPackage(packageName),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or
+                    android.app.PendingIntent.FLAG_IMMUTABLE,
+            ),
+        )
         val builder = PictureInPictureParams.Builder()
             .setAspectRatio(Rational(16, 9))
-            .setActions(listOf(action))
+            .setActions(listOf(action, speedAction))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             // Auto-enter (v0.1.12): the system enters PiP itself during
             // the home transition while this flag is on, instead of the
@@ -597,13 +655,35 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    /** True when the user has locked the device (or the screen has
+     *  turned off): the pause that follows is not a request to stop
+     *  playback, it is the transition to audio-only listening. */
+    private fun screenOffOrLocked(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (pm != null && !pm.isInteractive) return true
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        return km?.isKeyguardLocked == true
+    }
+
     override fun onPause() {
         resumed = false
-        posHandler.removeCallbacks(posPoller)
         savePosition("activity-pause")
         // In PiP the activity is paused but must keep playing: pausing
-        // the WebView would freeze the small window's playback.
-        if (!isInPictureInPictureMode) {
+        // the WebView would freeze the small window's playback. The
+        // same holds when the device is locked or the screen is off —
+        // playback continues as audio (v0.1.20), whether or not PiP
+        // was active. Only a foreground pause (leaving to another app
+        // with the screen on) pauses the WebView, and only then does
+        // the position poller stop.
+        val keepPlaying = isInPictureInPictureMode || screenOffOrLocked()
+        if (keepPlaying) {
+            Log.d(
+                PROBE_TAG,
+                "onPause: keeping playback (pip=$isInPictureInPictureMode " +
+                    "screenOffOrLocked=${screenOffOrLocked()})",
+            )
+        } else {
+            posHandler.removeCallbacks(posPoller)
             webView?.onPause()
         }
         super.onPause()
@@ -665,7 +745,14 @@ class PlayerActivity : AppCompatActivity() {
         const val TAG = "YtAdBlock"
         const val PROBE_TAG = "YtPlayerProbe"
         const val ACTION_PIP_TOGGLE = "app.ytclient.action.PIP_TOGGLE"
+        const val ACTION_PIP_SPEED = "app.ytclient.action.PIP_SPEED"
         const val PIP_REQUEST_CODE = 1
+        const val PIP_SPEED_REQUEST_CODE = 2
+
+        /** Rate steps the PiP speed action cycles through: the embed
+         *  player's own practical range, minus the extremes nobody
+         *  picks mid-video. */
+        val PIP_RATE_STEPS = listOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
 
         /**
          * Origin the wrapper page is served from, hence the Referer the
