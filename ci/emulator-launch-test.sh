@@ -2,6 +2,12 @@
 # Emulator launch test for YT Client. Launches every activity, checks the
 # top resumed activity and process liveness, captures screenshots, and
 # fails on any FATAL EXCEPTION for the app.
+#
+# Waits are condition-based (top activity, probe-log markers, process
+# state) with bounded timeouts — the fixed sleeps this script used
+# until 2026-11-21 summed to ~160 s of blind waiting per run. Every
+# wait still has a hard cap, so a genuinely stuck step fails fast
+# instead of hanging.
 set -u
 cd "$(dirname "$0")/.."
 APK=app/build/outputs/apk/debug/app-debug.apk
@@ -13,6 +19,31 @@ check_top() {
   local top; top=$(top_activity); echo "top after $2: $top"
   if echo "$top" | grep -q "$PKG/.$1"; then echo "OK: $1 is top"; else note_fail "$1 not top after $2"; fi
 }
+
+# --- condition waits ---------------------------------------------------
+# wait_until <timeout-sec> <description> <command...>: poll the command
+# every 2 s until it succeeds or the timeout expires.
+wait_until() {
+  local timeout=$1 desc=$2; shift 2
+  local waited=0
+  while [ $waited -lt $timeout ]; do
+    if "$@" >/dev/null 2>&1; then echo "wait ok: $desc (${waited}s)"; return 0; fi
+    sleep 2; waited=$((waited + 2))
+  done
+  echo "wait timeout: $desc (${timeout}s)"
+  return 1
+}
+top_is() { top_activity | grep -q "$PKG/.$1"; }
+pid_alive() { [ -n "$(adb shell pidof $PKG 2>/dev/null | tr -d '\r\n')" ]; }
+pid_gone() { [ -z "$(adb shell pidof $PKG 2>/dev/null | tr -d '\r\n')" ]; }
+probe_has() { adb logcat -d -s YtPlayerProbe:D 2>/dev/null | grep -q "$1"; }
+probe_has_re() { adb logcat -d -s YtPlayerProbe:D 2>/dev/null | grep -qE "$1"; }
+# Wait until the activity is on top, then check_top as the verdict.
+wait_top() { # activity, launch-description, timeout
+  wait_until "${3:-60}" "$1 on top" top_is "$1" || true
+  check_top "$1" "$2"
+}
+
 dismiss_anr() {
   # A system "isn't responding" dialog (the launcher ANR-ing under emulator
   # load) would otherwise sit on top of every screenshot. Tap its "Wait".
@@ -34,34 +65,36 @@ dismiss_anr() {
 screencap() { dismiss_anr; adb exec-out screencap -p > "$1" 2>/dev/null; echo "screenshot: $1 ($(stat -c%s "$1" 2>/dev/null) bytes)"; }
 
 adb root || true
-sleep 2
+wait_until 15 "adb responsive" adb shell echo ok || true
 adb install -r "$APK" || note_fail "adb install failed"
 adb shell cmd uimode night yes || true
-sleep 3
+sleep 2
 adb logcat -c || true
 
 adb shell am start -n $PKG/.MainActivity
-sleep 20
+wait_top MainActivity "MainActivity launch" 60
 PID=$(adb shell pidof $PKG | tr -d '\r\n'); echo "PID main: '$PID'"
 [ -n "$PID" ] || note_fail "process dead after MainActivity"
-check_top MainActivity "MainActivity launch"
+sleep 3
 screencap screenshot-main.png
 
 adb shell am start -n $PKG/.SearchActivity --es query "FRB"
-sleep 15
-check_top SearchActivity "SearchActivity launch"
+wait_top SearchActivity "SearchActivity launch" 45
+sleep 3
 screencap screenshot-search.png
 
 adb shell am start -n $PKG/.DetailActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up" --es channel_name "Rick_Astley" --es channel_id UCuAXFkgswL7iGxMpRfFONQA
-sleep 15
-check_top DetailActivity "DetailActivity launch"
+wait_top DetailActivity "DetailActivity launch" 45
+sleep 5
 screencap screenshot-detail.png
 
 adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
 # Let the embed settle: the player loads asynchronously and its
 # postMessage events (ready / state changes / errors) arrive over time.
-sleep 35
-check_top PlayerActivity "PlayerActivity launch"
+# Wait until the probe shows any verdict-relevant marker (playback
+# state, a state change, or an error) instead of a blind 35 s.
+wait_until 60 "player probe activity" probe_has_re 'playerState|onStateChange|"event":"onError"' || true
+wait_top PlayerActivity "PlayerActivity launch" 30
 screencap screenshot-player.png
 # Player verdict evidence. The wrapper page is cross-origin to the embed
 # iframe, so its DOM cannot be inspected; instead the player posts events
@@ -98,21 +131,21 @@ echo "adblock: $BLOCKED blocked request(s) logged so far"
 # again. Verdicts distinguish "the app misbehaved" from "the emulator
 # could not run the leg" instead of silently passing.
 adb shell am force-stop $PKG || true
-sleep 2
+wait_until 10 "process stopped" pid_gone || true
 adb logcat -c || true
 adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up" --es ci_set_rate "2.0"
 RATE_SETUP=0
-for i in $(seq 1 14); do
-  sleep 5
+for i in $(seq 1 25); do
   adb logcat -d -s YtPlayerProbe:D > probe-rate-setup.txt 2>&1 || true
   if grep -q "userRate=2.0" probe-rate-setup.txt; then RATE_SETUP=1; break; fi
+  sleep 2
 done
 PLAYING_SEEN=0
 grep -qE 'playerState\\?": ?1' probe-rate-setup.txt && PLAYING_SEEN=1
 echo "rate scenario setup: playing=$PLAYING_SEEN rate2=$RATE_SETUP"
 
 adb shell input keyevent KEYCODE_HOME
-sleep 6
+wait_until 20 "pip mode marker" probe_has "pip mode changed" || true
 adb shell dumpsys activity activities > pip-dumpsys.txt 2>&1 || true
 adb logcat -d -s YtPlayerProbe:D > probe-pip.txt 2>&1 || true
 screencap screenshot-pip.png
@@ -145,7 +178,10 @@ echo "pip return: tapping PiP window at $TX,$TY (bounds: ${PIP_BOUNDS:-fallback}
 adb shell input tap $TX $TY || true
 sleep 2
 adb shell input tap $TX $TY || true
-sleep 6
+wait_until 25 "return + rate reapply markers" probe_has "reapply playbackRate" || true
+# The player confirms the re-applied rate in a following probe event;
+# give it a brief settle so the confirmation is in the dump below.
+sleep 3
 adb logcat -d -s YtPlayerProbe:D > probe-return.txt 2>&1 || true
 RETURNED=0
 grep -q "pip mode changed: false" probe-return.txt && RETURNED=1
@@ -178,21 +214,24 @@ fi
 # leg is inconclusive rather than a failure: the tap target inside the
 # cross-origin embed cannot be addressed precisely.
 adb shell am force-stop $PKG || true
-sleep 2
+wait_until 10 "process stopped" pid_gone || true
 adb logcat -c || true
 adb shell am start -n $PKG/.PlayerActivity --es video_id dQw4w9WgXcQ --es title "Never_Gonna_Give_You_Up"
 PAUSED_SETUP=0
-for i in $(seq 1 14); do
-  sleep 5
+for i in $(seq 1 30); do
   adb logcat -d -s YtPlayerProbe:D > probe-pause-setup.txt 2>&1 || true
   grep -qE 'playerState\\?": ?1' probe-pause-setup.txt && break
+  sleep 2
 done
 if grep -qE 'playerState\\?": ?1' probe-pause-setup.txt; then
   for t in 1 2 3; do
     adb shell input tap 540 1100 || true
-    sleep 4
-    adb logcat -d -s YtPlayerProbe:D > probe-pause-setup.txt 2>&1 || true
-    if grep -qE 'playerState\\?": ?2' probe-pause-setup.txt; then PAUSED_SETUP=1; break; fi
+    for w in $(seq 1 6); do
+      adb logcat -d -s YtPlayerProbe:D > probe-pause-setup.txt 2>&1 || true
+      if grep -qE 'playerState\\?": ?2' probe-pause-setup.txt; then PAUSED_SETUP=1; break; fi
+      sleep 2
+    done
+    [ "$PAUSED_SETUP" -eq 1 ] && break
   done
 fi
 echo "paused scenario setup: paused=$PAUSED_SETUP"
@@ -200,7 +239,13 @@ if [ "$PAUSED_SETUP" -eq 1 ]; then
   adb logcat -c || true
   sleep 1
   adb shell input keyevent KEYCODE_HOME
-  sleep 6
+  # Negative check: observe a bounded window for the failure marker.
+  # Polling cannot prove an absence, but it can end the window the
+  # moment the bad outcome appears instead of always waiting it out.
+  for w in $(seq 1 4); do
+    if probe_has "pip mode changed: true"; then break; fi
+    sleep 2
+  done
   adb logcat -d -s YtPlayerProbe:D > probe-paused-home.txt 2>&1 || true
   echo "--- paused-home evidence (probe) ---"
   grep -E "userLeaveHint|pip enter|pip mode" probe-paused-home.txt | tail -5 || true
@@ -214,13 +259,13 @@ else
 fi
 
 adb shell am start -n $PKG/.ChannelActivity --es channel_id UCvbobBwsNzBY4IV1vLH6Kkg --es channel_name "IG_Japan"
-sleep 15
-check_top ChannelActivity "ChannelActivity launch"
+wait_top ChannelActivity "ChannelActivity launch" 45
+sleep 5
 screencap screenshot-channel.png
 
 adb shell am start -n $PKG/.ChannelListActivity --es group_name "経済" --esa channel_ids UCvbobBwsNzBY4IV1vLH6Kkg,UCuAXFkgswL7iGxMpRfFONQA
-sleep 15
-check_top ChannelListActivity "ChannelListActivity launch"
+wait_top ChannelListActivity "ChannelListActivity launch" 45
+sleep 3
 screencap screenshot-channellist.png
 
 PID2=$(adb shell pidof $PKG | tr -d '\r\n'); echo "PID end: '$PID2'"
