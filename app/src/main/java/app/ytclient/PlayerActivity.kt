@@ -142,6 +142,16 @@ import java.io.ByteArrayInputStream
  * 1.0 / 1.5 / 2.0 (Yosuke: three are enough) and the icon is a bitmap
  * with the current rate drawn as text, so the rate is visible at a
  * glance and each tap advances it.
+ *
+ * v0.1.22: rate desync after PiP -> lock -> return (on-device report:
+ * the display showed 1.5x while playback was actually 1x). The return
+ * paths (PiP exit, resume) used a single fire-and-forget re-apply,
+ * which can land before the player is ready after the lock interval
+ * — and the embed's silent background reset to 1x then stands, under
+ * a settings UI that still shows the user's rate. Both paths now
+ * re-arm the remembered rate as the rate target (armRateTarget), so
+ * the player's own reports drive the confirmation loop until it
+ * verifiably plays at the target.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -429,14 +439,27 @@ class PlayerActivity : AppCompatActivity() {
         return Icon.createWithBitmap(bmp)
     }
 
-    /** Re-apply the user's chosen rate if the player may have reset it
-     *  while we were away. Idempotent: sending the current rate again is
-     *  a no-op for the player. */
-    private fun maybeReapplyRate(reason: String) {
+    /** Re-establish the user's rate after a background interval (PiP
+     *  exit, lock screen, app switch). A single fire-and-forget send
+     *  is not enough: the embed silently resets its rate to 1x while
+     *  backgrounded — its settings UI keeps showing the user's rate —
+     *  and a send issued during the return transition can land before
+     *  the player is ready to honour it, leaving actual playback at
+     *  1x under a 1.5x display (on-device report, 2026-11-22: PiP,
+     *  then lock, then return). So the remembered rate is re-armed as
+     *  the rate target: the player's own rate reports then drive the
+     *  confirmation loop in onRateObserved — differing reports trigger
+     *  bounded re-applies, an equal report confirms — until the player
+     *  is verifiably playing at the target. The immediate send and its
+     *  log line keep the "reapply playbackRate" probe vocabulary the
+     *  CI rate scenario greps for. */
+    private fun armRateTarget(reason: String) {
         val rate = userRate ?: return
         if (rate == 1.0) return
+        rateTarget = rate
+        rateApplyAttempts = 1
         sendPlayerCommand("setPlaybackRate", rate.toString())
-        Log.d(PROBE_TAG, "reapply playbackRate $rate ($reason)")
+        Log.d(PROBE_TAG, "reapply playbackRate $rate ($reason, target armed)")
     }
 
     /** A playback rate reported by the player. Only foreground reports
@@ -687,7 +710,7 @@ class PlayerActivity : AppCompatActivity() {
         }
         if (!isInPictureInPictureMode) {
             // Back to full screen: the rate may have been reset in PiP.
-            maybeReapplyRate("pip-exit")
+            armRateTarget("pip-exit")
         }
     }
 
@@ -732,7 +755,7 @@ class PlayerActivity : AppCompatActivity() {
         posHandler.removeCallbacks(posPoller)
         posHandler.postDelayed(posPoller, 5000)
         if (hasResumedOnce) {
-            maybeReapplyRate("resume")
+            armRateTarget("resume")
         } else {
             hasResumedOnce = true
         }
