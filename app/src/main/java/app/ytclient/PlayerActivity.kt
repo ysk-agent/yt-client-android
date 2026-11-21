@@ -19,6 +19,7 @@ import android.util.Rational
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
+import android.widget.FrameLayout
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -93,6 +94,25 @@ import java.io.ByteArrayInputStream
  *   is dropped again): with targetSdk 35 the activity draws
  *   edge-to-edge, and without the inset the embed's top controls sat
  *   underneath the system status bar.
+ *
+ * v0.1.16: two of the v0.1.15 mechanisms were wrong, found on-device
+ * (logcat of the user's own session, 2026-11-21):
+ * - Rate memory erased itself. A fresh player's first infoDelivery
+ *   bundles playerState=1 with playbackRate=1 (its default), and the
+ *   parser handled the rate first: the default report was persisted
+ *   over the remembered rate before the apply step read it back, so
+ *   nothing was ever applied. The remembered rate is now a target
+ *   held in memory: differing reports while a target is pending are
+ *   the not-yet-applied default — they trigger a re-apply (bounded)
+ *   and are never persisted; only the player's confirmation of the
+ *   target, or a report with no target pending, counts as a choice.
+ * - WebView padding does not move web content (the page is composited
+ *   over the view's full bounds), so the status-bar inset now shrinks
+ *   the WebView's layout bounds instead: a top margin equal to the
+ *   status-bar height, removed again in PiP.
+ * - Duration actually arrives inside info.progressState, not as a
+ *   top-level info field; the parser reads it from there (the
+ *   near-end resume-point clearing depends on it).
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -119,8 +139,20 @@ class PlayerActivity : AppCompatActivity() {
      *  starts, so the launch test can drive the rate fix scenario. */
     private var pendingCiRate: Double? = null
 
-    /** Status-bar height in px, applied as the WebView's top padding
-     * outside PiP so the embed's top controls clear the system bar. */
+    /** The rate this session must establish — the remembered rate, or
+     * the CI hook's — until the player confirms it by reporting it
+     * back. While non-null, a differing rate report is the player's
+     * not-yet-applied default: it triggers a bounded re-apply and is
+     * never treated as the user's choice (v0.1.16; in v0.1.15 such a
+     * report overwrote the remembered rate before it could be applied,
+     * so rate memory never survived into a second video). */
+    @Volatile private var rateTarget: Double? = null
+    @Volatile private var rateApplyAttempts = 0
+
+    /** Status-bar height in px, applied as the WebView's top layout
+     * margin outside PiP so the embed's top controls clear the system
+     * bar. (Padding does not work: web content is composited over the
+     * WebView's full bounds regardless of padding.) */
     private var statusBarPad = 0
 
     /** True once this instance has seen its first "playing" state: the
@@ -160,19 +192,17 @@ class PlayerActivity : AppCompatActivity() {
         videoId = intent.getStringExtra("video_id") ?: ""
         intent.getStringExtra("title")?.takeIf { it.isNotBlank() }?.let { title = it }
         pendingCiRate = intent.getStringExtra("ci_set_rate")?.toDoubleOrNull()
+        // The rate to establish for this video: the CI hook wins,
+        // otherwise the app-wide remembered rate. Seeded into userRate
+        // as well, so the resume re-apply works from the start.
+        rateTarget = pendingCiRate ?: Prefs.playbackRate(this).takeIf { it != 1.0 }
+        rateTarget?.let { userRate = it }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val sbRes = resources.getIdentifier("status_bar_height", "dimen", "android")
         statusBarPad = if (sbRes > 0) resources.getDimensionPixelSize(sbRes) else 0
         val wv = WebView(this).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            )
             setBackgroundColor(Color.BLACK)
-            // Edge-to-edge (targetSdk 35) would otherwise slide the
-            // embed's top controls under the status bar.
-            setPadding(0, statusBarPad, 0, 0)
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -182,7 +212,16 @@ class PlayerActivity : AppCompatActivity() {
             addJavascriptInterface(ProbeBridge(), "YtProbe")
         }
         webView = wv
-        setContentView(wv)
+        // Edge-to-edge (targetSdk 35) would otherwise slide the embed's
+        // top controls under the status bar. The WebView's own bounds
+        // are moved down by the status-bar height (a margin, not
+        // padding — web content ignores padding); PiP removes it again.
+        val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        container.addView(wv, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ).apply { topMargin = statusBarPad })
+        setContentView(container)
 
         val filter = IntentFilter(ACTION_PIP_TOGGLE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -305,11 +344,44 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     /** A playback rate reported by the player. Only foreground reports
-     *  are the user's choice; background reports (above all the spurious
-     *  reset to 1x) must not clobber [userRate]. A foreground choice is
-     *  also the app-wide remembered rate for the next video. */
+     *  count at all; background reports (above all the spurious reset
+     *  to 1x) must not clobber [userRate].
+     *
+     *  While a [rateTarget] is pending, a report is judged against it:
+     *  an equal report confirms the target (the remembered rate is now
+     *  actually playing); a differing report is the player's
+     *  not-yet-applied default, so the target is re-applied (bounded)
+     *  and the report is otherwise ignored — never persisted, never
+     *  taken as a choice. With no target pending, a foreground report
+     *  IS the user's choice and becomes the remembered rate. */
     private fun onRateObserved(rate: Double) {
         if (!resumed) return
+        val target = rateTarget
+        if (target != null) {
+            when {
+                rate == target -> {
+                    rateTarget = null
+                    userRate = rate
+                    Log.d(PROBE_TAG, "rate confirmed: $rate")
+                }
+                rateApplyAttempts < 5 -> {
+                    rateApplyAttempts++
+                    Log.d(PROBE_TAG, "rate not applied yet (saw $rate, want $target), reapply #$rateApplyAttempts")
+                    sendPlayerCommand("setPlaybackRate", target.toString())
+                }
+                else -> {
+                    // The player keeps reporting something else (e.g.
+                    // the user picked another rate before ours landed):
+                    // accept the report as the choice instead of
+                    // fighting it forever.
+                    rateTarget = null
+                    userRate = rate
+                    Prefs.setPlaybackRate(this, rate)
+                    Log.d(PROBE_TAG, "rate target abandoned; accepted $rate")
+                }
+            }
+            return
+        }
         if (userRate != rate) {
             userRate = rate
             Prefs.setPlaybackRate(this, rate)
@@ -350,13 +422,13 @@ class PlayerActivity : AppCompatActivity() {
                 Log.d(PROBE_TAG, "pos restore: seekTo $saved for $videoId")
                 sendPlayerCommand("seekTo", "$saved,true")
             }
-            // The remembered rate (or the CI hook's rate) applies from
-            // the start of every playback session.
-            val rate = pendingCiRate ?: Prefs.playbackRate(this).takeIf { it != 1.0 }
-            pendingCiRate = null
-            if (rate != null) {
-                Log.d(PROBE_TAG, "initial rate apply: $rate")
-                sendPlayerCommand("setPlaybackRate", rate.toString())
+            // Establish the session's rate target (remembered rate or
+            // CI hook). Confirmation and any re-applies are driven by
+            // onRateObserved from here on.
+            rateTarget?.let {
+                rateApplyAttempts++
+                Log.d(PROBE_TAG, "initial rate apply: $it")
+                sendPlayerCommand("setPlaybackRate", it.toString())
             }
         }
         if (state == 0) {
@@ -397,8 +469,12 @@ class PlayerActivity : AppCompatActivity() {
                     val t = info.optDouble("currentTime", Double.NaN)
                     if (!t.isNaN() && t >= 0) lastPosSec = t
                 }
-                if (info.has("duration")) {
-                    val d = info.optDouble("duration", Double.NaN)
+                // Duration rides inside progressState in the real
+                // payload (verified on-device, 2026-11-21); a top-level
+                // field is not sent.
+                val durObj = if (info.has("duration")) info else info.optJSONObject("progressState")
+                if (durObj != null && durObj.has("duration")) {
+                    val d = durObj.optDouble("duration", Double.NaN)
                     if (!d.isNaN() && d > 0) lastDurSec = d
                 }
                 if (info.has("playerState")) {
@@ -478,7 +554,13 @@ class PlayerActivity : AppCompatActivity() {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         Log.d(PROBE_TAG, "pip mode changed: $isInPictureInPictureMode")
         // The small window has no status bar to clear: drop the inset.
-        webView?.setPadding(0, if (isInPictureInPictureMode) 0 else statusBarPad, 0, 0)
+        webView?.let { wv ->
+            val lp = wv.layoutParams as? FrameLayout.LayoutParams
+            if (lp != null) {
+                lp.topMargin = if (isInPictureInPictureMode) 0 else statusBarPad
+                wv.layoutParams = lp
+            }
+        }
         if (!isInPictureInPictureMode) {
             // Back to full screen: the rate may have been reset in PiP.
             maybeReapplyRate("pip-exit")
