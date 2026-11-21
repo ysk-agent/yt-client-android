@@ -9,7 +9,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
@@ -130,6 +134,14 @@ import java.io.ByteArrayInputStream
  *   the screen is off or the keyguard is locked, the WebView is left
  *   running exactly as it is in PiP, so playback continues as audio
  *   regardless of whether PiP was active.
+ *
+ * v0.1.21: the PiP speed action is refined from on-device use. The
+ * action itself worked (the rate changed), but its system icon
+ * rendered as a wrench rather than a gear, and the rate in its title
+ * never appeared on screen (PiP shows icons only). The steps are now
+ * 1.0 / 1.5 / 2.0 (Yosuke: three are enough) and the icon is a bitmap
+ * with the current rate drawn as text, so the rate is visible at a
+ * glance and each tap advances it.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -393,6 +405,30 @@ class PlayerActivity : AppCompatActivity() {
         if (rate == rate.toLong().toDouble()) rate.toLong().toString()
         else rate.toString()
 
+    /** The PiP speed action's icon: the current rate drawn as text.
+     *  PiP renders custom actions as icons only — the action title is
+     *  an accessibility label and never appears on screen (verified
+     *  on-device with v0.1.20, whose system "preferences" icon also
+     *  rendered as a wrench, not a gear) — so the rate itself has to
+     *  be the picture (v0.1.21, Yosuke: showing the rate is better). */
+    private fun rateIcon(rate: Double): Icon {
+        val size = 96
+        val label = "${formatRate(rate)}x"
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = 46f
+            val w = measureText(label)
+            if (w > size * 0.94f) textSize = 46f * (size * 0.94f) / w
+        }
+        val y = size / 2f - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText(label, size / 2f, y, paint)
+        return Icon.createWithBitmap(bmp)
+    }
+
     /** Re-apply the user's chosen rate if the player may have reset it
      *  while we were away. Idempotent: sending the current rate again is
      *  a no-op for the player. */
@@ -587,7 +623,7 @@ class PlayerActivity : AppCompatActivity() {
         )
         val speedLabel = "速度 ${formatRate(userRate ?: 1.0)}x"
         val speedAction = RemoteAction(
-            Icon.createWithResource(this, android.R.drawable.ic_menu_preferences),
+            rateIcon(userRate ?: 1.0),
             speedLabel,
             speedLabel,
             android.app.PendingIntent.getBroadcast(
@@ -749,10 +785,9 @@ class PlayerActivity : AppCompatActivity() {
         const val PIP_REQUEST_CODE = 1
         const val PIP_SPEED_REQUEST_CODE = 2
 
-        /** Rate steps the PiP speed action cycles through: the embed
-         *  player's own practical range, minus the extremes nobody
-         *  picks mid-video. */
-        val PIP_RATE_STEPS = listOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
+        /** Rate steps the PiP speed action cycles through (Yosuke,
+         *  2026-11-21: three are enough — 1.0 / 1.5 / 2.0). */
+        val PIP_RATE_STEPS = listOf(1.0, 1.5, 2.0)
 
         /**
          * Origin the wrapper page is served from, hence the Referer the
