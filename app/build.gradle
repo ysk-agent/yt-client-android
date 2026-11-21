@@ -12,8 +12,8 @@ android {
         applicationId 'app.ytclient'
         minSdk 26
         targetSdk 35
-        versionCode 19
-        versionName '0.1.18'
+        versionCode 20
+        versionName '0.1.19'
         // Gemini key for the Detail screen's subtitle formatting. Injected
         // by CI from the GEMINI_API_KEY repo secret; empty for local builds
         // (the 整形 button then just toasts that no key is configured).

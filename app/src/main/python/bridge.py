@@ -100,12 +100,125 @@ def search(query: str) -> str:
     return _run(go)
 
 
-def search_next(continuation: str) -> str:
+def _pb_varint_field(num: int, value: int) -> bytes:
+    out = bytearray()
+    for part in ((num << 3) | 0, value):
+        v = part
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            if v:
+                out.append(b | 0x80)
+            else:
+                out.append(b)
+                break
+    return bytes(out)
+
+
+def _pb_msg_field(num: int, payload: bytes) -> bytes:
+    out = bytearray()
+    for part in ((num << 3) | 2, len(payload)):
+        v = part
+        while True:
+            b = v & 0x7F
+            v >>= 7
+            if v:
+                out.append(b | 0x80)
+            else:
+                out.append(b)
+                break
+    return bytes(out) + payload
+
+
+def _search_params(sort: int, upload: int, duration: int, features) -> str | None:
+    """Builds the Innertube search params token (the web UI's "sp")
+    from structured options. The field layout was decoded from real
+    sp tokens on youtube.com search pages and verified behaviourally
+    through this client (2026-11-21):
+
+    outer field 1 = sort (1=rating, 2=upload date, 3=view count;
+    0/absent = relevance); outer field 2 = filters message with
+    field 1 = upload date (1=hour, 2=today, 3=week, 4=month, 5=year),
+    field 3 = duration (2 = 20 min or more, 4 = under 3 min,
+    5 = 3-20 min), and one varint field per feature set to 1
+    (4=HD, 5=subtitles, 8=live, 14=4K).
+    """
+    import base64
+
+    filters = bytearray()
+    if 1 <= upload <= 5:
+        filters += _pb_varint_field(1, upload)
+    if duration in (2, 4, 5):
+        filters += _pb_varint_field(3, duration)
+    for fnum in features or ():
+        if fnum in (4, 5, 8, 14):
+            filters += _pb_varint_field(fnum, 1)
+    outer = bytearray()
+    if 1 <= sort <= 3:
+        outer += _pb_varint_field(1, sort)
+    if filters:
+        outer += _pb_msg_field(2, bytes(filters))
+    if not outer:
+        return None
+    return base64.b64encode(bytes(outer)).decode()
+
+
+def _locale(opts: dict) -> tuple[str, str]:
+    """hl/gl from an options dict, strictly shaped (they land in the
+    Innertube context verbatim): hl like "ja" / "zh-Hans", gl a
+    two-letter region code. Anything else falls back to ja/JP."""
+    import re
+
+    hl = str(opts.get("hl") or "ja")
+    gl = str(opts.get("gl") or "JP")
+    if not re.fullmatch(r"[a-z]{2,3}(-[A-Za-z]{2,4})?", hl):
+        hl = "ja"
+    if not re.fullmatch(r"[A-Z]{2}", gl):
+        gl = "JP"
+    return hl, gl
+
+
+def search_opt(query: str, options_json: str) -> str:
+    """Search with YouTube's own filters/sort (see _search_params) and
+    a region/language pair. options_json: {"sort": 0-3,
+    "upload": 0-5, "duration": 0|2|4|5, "features": [field numbers],
+    "hl": "ja", "gl": "JP"}. Paging continues via search_next with
+    the same hl/gl; the continuation token already carries the
+    filter/sort conditions."""
     async def go():
         from yt_search import YoutubeSearchClient
 
+        try:
+            opts = json.loads(options_json) if options_json else {}
+        except ValueError:
+            opts = {}
+        params = _search_params(
+            int(opts.get("sort") or 0),
+            int(opts.get("upload") or 0),
+            int(opts.get("duration") or 0),
+            opts.get("features") or (),
+        )
+        hl, gl = _locale(opts)
         async with YoutubeSearchClient(
-            hl="ja", gl="JP", state_file=_state("yt_search")
+            hl=hl, gl=gl, state_file=_state("yt_search")
+        ) as c:
+            page = await c.search(query, params)
+            return {
+                "items": _videos_only(page.items),
+                "continuation": page.continuation,
+                "estimated_results": page.estimated_results,
+            }
+
+    return _run(go)
+
+
+def search_next(continuation: str, hl: str = "ja", gl: str = "JP") -> str:
+    async def go():
+        from yt_search import YoutubeSearchClient
+
+        hl2, gl2 = _locale({"hl": hl, "gl": gl})
+        async with YoutubeSearchClient(
+            hl=hl2, gl=gl2, state_file=_state("yt_search")
         ) as c:
             page = await c.next_page(continuation)
             return {"items": _videos_only(page.items), "continuation": page.continuation}

@@ -276,6 +276,15 @@ object Prefs {
             .putString("feed_anchor_$group", "$videoId|$offsetPx").apply()
     }
 
+    /** Search conditions (sort / filters / locale / operator assist /
+     * on-device filters) as one JSON object written by SearchActivity,
+     * so a search reopens with the conditions the user last used. */
+    fun searchConditions(ctx: android.content.Context): String? =
+        ctx.getSharedPreferences(FILE, 0).getString("search_conditions", null)
+    fun setSearchConditions(ctx: android.content.Context, json: String) {
+        ctx.getSharedPreferences(FILE, 0).edit().putString("search_conditions", json).apply()
+    }
+
     /** The playback rate the user last chose in the player, remembered
      * app-wide: a newly opened video starts at this rate. */
     fun playbackRate(ctx: android.content.Context): Double =
