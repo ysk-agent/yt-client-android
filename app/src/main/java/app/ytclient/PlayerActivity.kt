@@ -379,6 +379,17 @@ class PlayerActivity : AppCompatActivity() {
                     userRate = rate
                     Log.d(PROBE_TAG, "rate confirmed: $rate")
                 }
+                !startedOnce -> {
+                    // Playback has not begun yet: this report is the
+                    // fresh player's default, sent before the target
+                    // could possibly apply. It must not consume the
+                    // re-apply budget — the target goes out when
+                    // playback starts, and only reports after that are
+                    // judged. (Burning the budget here is what the CI
+                    // rate scenario caught: five pre-start reports
+                    // abandoned the target before the state-1 apply.)
+                    Log.d(PROBE_TAG, "rate pre-start report $rate ignored (target $target)")
+                }
                 rateApplyAttempts < 5 -> {
                     rateApplyAttempts++
                     Log.d(PROBE_TAG, "rate not applied yet (saw $rate, want $target), reapply #$rateApplyAttempts")
