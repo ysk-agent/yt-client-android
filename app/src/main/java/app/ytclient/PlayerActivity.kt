@@ -377,7 +377,11 @@ class PlayerActivity : AppCompatActivity() {
                 rate == target -> {
                     rateTarget = null
                     userRate = rate
-                    Log.d(PROBE_TAG, "rate confirmed: $rate")
+                    // Same "userRate=" marker as the remembered-rate
+                    // line below: it is the probe vocabulary for "the
+                    // user's rate is now in effect", and the CI rate
+                    // scenario greps for it.
+                    Log.d(PROBE_TAG, "userRate=$rate (target confirmed)")
                 }
                 !startedOnce -> {
                     // Playback has not begun yet: this report is the
