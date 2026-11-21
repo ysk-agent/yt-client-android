@@ -163,6 +163,16 @@ import java.io.ByteArrayInputStream
  * is desired (desiredPlaying) is now answered with playVideo, up to
  * 3 attempts per episode; an on-screen pause remains the user's and
  * clears the desire, as does the PiP toggle.
+ *
+ * v0.1.24: measured outcome of the v0.1.23 lock test — playVideo
+ * while the page is hidden does nothing (position froze for the
+ * whole lock interval), so lock-screen audio is not reachable inside
+ * the embed; the auto-resume does fire on return, but the player
+ * then REPORTS 1.5 while position tracking proves it plays at 1.0x:
+ * the hidden-page cycle desyncs the media rate from the reported
+ * rate, which the report-based confirmation loop cannot see. After
+ * such an episode (rateToggleNeeded), the next playing state forces
+ * re-application by toggling the rate through 1.0 to the target.
  */
 class PlayerActivity : AppCompatActivity() {
     private var webView: WebView? = null
@@ -221,6 +231,15 @@ class PlayerActivity : AppCompatActivity() {
      *  bounded auto-resume (v0.1.23). */
     @Volatile private var desiredPlaying = false
     @Volatile private var autoResumeAttempts = 0
+
+    /** Set when a background episode may have desynced the player's
+     *  rate: after the hidden-page cycle the player REPORTS the user's
+     *  rate while the media actually plays at 1.0 (measured on-device,
+     *  2026-11-22: reports said 1.5 while position advanced at 1.0x),
+     *  so the report-based confirmation loop cannot detect it. The
+     *  next playing state consumes this flag and forces the media to
+     *  re-apply the rate by toggling through 1.0 (v0.1.24). */
+    @Volatile private var rateToggleNeeded = false
 
     /** Last position / duration (seconds) the player reported through
      * the probe, and the last position actually persisted. */
@@ -486,6 +505,7 @@ class PlayerActivity : AppCompatActivity() {
     private fun armRateTarget(reason: String) {
         val rate = userRate ?: return
         if (rate == 1.0) return
+        if (screenOffOrLocked()) rateToggleNeeded = true
         rateTarget = rate
         rateApplyAttempts = 1
         sendPlayerCommand("setPlaybackRate", rate.toString())
@@ -580,6 +600,22 @@ class PlayerActivity : AppCompatActivity() {
         if (state == 1) {
             desiredPlaying = true
             autoResumeAttempts = 0
+            if (rateToggleNeeded) {
+                rateToggleNeeded = false
+                val target = rateTarget ?: userRate
+                if (target != null && target != 1.0) {
+                    // Force the media element to re-apply the rate:
+                    // after a hidden-page episode it reports the target
+                    // while playing at 1.0, and re-sending the same
+                    // value is a no-op in its settings state. Toggle
+                    // through 1.0 so the value actually changes twice.
+                    Log.d(PROBE_TAG, "rate toggle: 1.0 -> $target (post-background)")
+                    sendPlayerCommand("setPlaybackRate", "1.0")
+                    posHandler.postDelayed({
+                        sendPlayerCommand("setPlaybackRate", target.toString())
+                    }, 400)
+                }
+            }
         }
         if (state == 1 && !startedOnce) {
             startedOnce = true
@@ -618,6 +654,7 @@ class PlayerActivity : AppCompatActivity() {
             // screen IS the user's, and clears the desire.
             val inPip = isInPictureInPictureMode
             val locked = screenOffOrLocked()
+            if ((inPip || locked) && desiredPlaying) rateToggleNeeded = true
             if (!inPip && !locked) {
                 desiredPlaying = false
             } else if (desiredPlaying && autoResumeAttempts < 3) {
