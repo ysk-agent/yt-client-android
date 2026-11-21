@@ -3,6 +3,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      test_scope:
+        description: "Emulator test scope (marker = read the [test: ...] marker from the HEAD commit message)"
+        type: choice
+        options: [marker, all, player, feed, none]
+        default: marker
 permissions:
   contents: read
 jobs:
@@ -11,6 +17,26 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # The committing agent picks the emulator test scope per change
+      # with a [test: all|player|feed|none] marker in the commit
+      # message; no marker means all. A manual dispatch can override.
+      - name: Determine test scope
+        id: scope
+        run: |
+          SCOPE="${{ inputs.test_scope }}"
+          if [ -z "$SCOPE" ] || [ "$SCOPE" = "marker" ]; then
+            MSG=$(git log -1 --format=%B)
+            M=$(echo "$MSG" | grep -oE '\[test: (all|player|feed|none)\]' | head -1 | sed 's/\[test: //; s/\]//')
+            SCOPE="${M:-all}"
+          fi
+          echo "test scope: $SCOPE"
+          case "$SCOPE" in
+            all)    echo "sections=all"    >> "$GITHUB_OUTPUT"; echo "run_emulator=true"  >> "$GITHUB_OUTPUT" ;;
+            player) echo "sections=player" >> "$GITHUB_OUTPUT"; echo "run_emulator=true"  >> "$GITHUB_OUTPUT" ;;
+            feed)   echo "sections=feed"   >> "$GITHUB_OUTPUT"; echo "run_emulator=true"  >> "$GITHUB_OUTPUT" ;;
+            none)   echo "sections="       >> "$GITHUB_OUTPUT"; echo "run_emulator=false" >> "$GITHUB_OUTPUT" ;;
+            *)      echo "sections=all"    >> "$GITHUB_OUTPUT"; echo "run_emulator=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -51,6 +77,7 @@ jobs:
           path: yt-client.apk
           if-no-files-found: error
       - name: Enable KVM
+        if: steps.scope.outputs.run_emulator == 'true'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -60,6 +87,7 @@ jobs:
       # boots once and saves a clean snapshot; later runs restore it
       # and boot from the snapshot instead of cold-booting.
       - name: AVD cache
+        if: steps.scope.outputs.run_emulator == 'true'
         uses: actions/cache@v4
         id: avd-cache
         with:
@@ -68,7 +96,7 @@ jobs:
             ~/.android/adb*
           key: avd-35-pixel6-v1
       - name: Create AVD and generate snapshot for caching
-        if: steps.avd-cache.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.run_emulator == 'true' && steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -79,6 +107,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: echo "Generated AVD snapshot for caching."
       - name: Launch app on emulator
+        if: steps.scope.outputs.run_emulator == 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -87,9 +116,9 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: bash ci/emulator-launch-test.sh
+          script: TEST_SECTIONS=${{ steps.scope.outputs.sections }} bash ci/emulator-launch-test.sh
       - name: Upload launch diagnostics
-        if: always()
+        if: always() && steps.scope.outputs.run_emulator == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: launch-diagnostics
